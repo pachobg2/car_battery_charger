@@ -2,9 +2,9 @@
 
 Standalone smart charger for flooded/AGM 12V car batteries (44-100Ah).
 No WiFi/MQTT/cloud/OTA — everything is local: an INA219 current sensor,
-a second ADC-based supply-voltage sense, a SH1106 128x64 OLED, and a
-rotary encoder with push button are the entire interface. Re-flashing
-always needs a USB cable.
+a second ADC-based supply-voltage sense, a SH1106 128x64 OLED, a rotary
+encoder with push button, and a piezo buzzer are the entire interface.
+Re-flashing always needs a USB cable.
 
 **Read the Hardware section below before wiring this up.** This design
 regulates charge current by running a bank of 4 parallel IRL540N MOSFETs
@@ -54,10 +54,16 @@ There's no OTA in this build — flash over USB every time.
 | MOSFET gate bias (via RC filter, feeds all 4 gates) | GPIO1 | LEDC PWM, 20kHz carrier |
 | Supply-rail voltage divider | GPIO0 | ADC1_CH0, see Voltage sensing below |
 | Status LED (onboard WS2812) | GPIO10 | matches `smart_switch`'s convention |
+| Piezo buzzer | GPIO8 | see note below — this is a strapping pin |
 
-Avoid the ESP32-C3 strapping pins (GPIO2, 8, 9) for anything with an
-external pull resistor or load on it — GPIO9 is also the BOOT button on
-most dev boards.
+Every non-strapping GPIO is already spoken for above, so the buzzer
+defaults to GPIO8 — a strapping pin, but one only sampled at boot/reset;
+this sketch never drives it until well after boot, and a bare piezo (no
+extra pull resistor of your own) shouldn't disturb that sampling. Verify
+your specific board doesn't already use GPIO8 for something else first
+(a few ESP32-C3 dev boards put a second onboard LED there) — GPIO2 is
+the fallback if so. Avoid GPIO9 for anything external — it's the BOOT
+button on most of these boards.
 
 ### Voltage sensing — read this before wiring, it changes the topology
 
@@ -185,6 +191,34 @@ before the current register overflows — comfortable headroom above the
 range, recompute both constants together; they only make sense as a
 matched pair.
 
+### Piezo buzzer
+
+A passive piezo on `BUZZER_PIN`, driven via the ESP32 core's
+`tone()`/`noTone()` — it manages its own LEDC channel internally, so it
+doesn't conflict with the MOSFET gate's own `ledcAttach()` on a
+different pin. Wire it straight off the GPIO through a small series
+resistor (100Ω, protects the pin from the piezo's capacitive inrush).
+For louder output than a bare piezo gives at 3.3V, drive it through a
+small NPN transistor instead (GPIO → base resistor, piezo + resistor
+from 3V3/5V → collector, emitter → GND) — optional, not required for a
+basic audible alert.
+
+It plays a short, non-blocking tone pattern (`updateBuzzer()`, called
+every `loop()` iteration, steps through the pattern by elapsed time —
+never a `delay()`, so it can't stall the control loop or encoder) on
+every charge state transition:
+
+- **Charging starts** — a short rising chirp.
+- **Charge completes** — a rising triple beep.
+- **Fault, including a refused start** (no battery detected, voltage
+  already too high, over-voltage/over-current/timeout) — a low triple
+  beep.
+- **Manual stop** — a single neutral click.
+
+Patterns are plain frequency/duration arrays in `config.h` (`BUZZER_START_*`,
+`BUZZER_DONE_*`, `BUZZER_FAULT_*`, `BUZZER_STOP_*`) if you want to change
+the tones. Set `BUZZER_ENABLED = false` to disable it entirely.
+
 ## Charge algorithm
 
 Three stages for flooded/AGM lead-acid, no continuous float:
@@ -232,7 +266,8 @@ predictable.
 
 The onboard status LED (if present/enabled) mirrors state at a glance:
 blue = idle, yellow = bulk, orange = absorption, green = done, red =
-fault.
+fault. The buzzer backs this up audibly — see "Piezo buzzer" above — so
+a state change registers even if you're not looking at the device.
 
 ## Tuning the control loop
 
@@ -272,3 +307,4 @@ unattended.
 | v1.0.0 | 2026-09-18 | Initial firmware: 3-stage (bulk/absorption/done) lead-acid charging via linear-region IRL540N control, INA219 sensing, SH1106 OLED status/progress display, rotary-encoder local UI with easy-mode capacity presets, MQTT + Home Assistant discovery, ArduinoOTA. |
 | v1.1.0 | 2026-09-18 | Removed MQTT/Home Assistant connectivity and ArduinoOTA entirely -- standalone local-only device now (encoder + OLED only), no WiFi. Added a custom INA219 calibration for a 0.01 ohm/25W shunt resistor (replacing the breakout's stock 0.1 ohm shunt), raising accurate current range to ~13A and `MAX_CHARGE_CURRENT_A` to 10A; added a throttled Serial tuning log to the control loop. |
 | v1.2.0 | 2026-09-18 | Fixed a battery-voltage measurement bug: the INA219's bus-voltage reading is the floating MOSFET-side return rail, not battery voltage, given the low-side MOSFET placement -- added a second resistor divider into an ESP32 ADC pin (GPIO0) to measure the actual supply rail, and compute battery voltage as supply_measured minus the INA219 bus reading. Also moved the MOSFET stage to a bank of 4 parallel IRL540Ns with per-device source ballast resistors for current sharing, spreading the ~145W worst-case dissipation at the 10A ceiling across multiple packages. |
+| v1.3.0 | 2026-09-18 | Added a piezo buzzer (GPIO8) with a non-blocking tone sequencer (`updateBuzzer()`): distinct patterns for charge start, charge complete, fault/refused start, and manual stop. |

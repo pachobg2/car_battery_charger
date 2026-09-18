@@ -51,6 +51,13 @@
  * from config.h's CAPACITY_PRESETS_AH, which auto-computes the bulk
  * current from BULK_CURRENT_FRACTION_OF_CAPACITY).
  *
+ * A piezo buzzer (BUZZER_PIN, driven via tone()/noTone()) plays a short
+ * non-blocking tone pattern on every charge state transition: a rising
+ * chirp on start, a rising triple beep on a completed charge, a low
+ * triple beep on any fault (including a refused start), and a single
+ * neutral click on a manual stop. See updateBuzzer() below and the
+ * BUZZER_* patterns in config.h.example.
+ *
  * Libraries needed (Arduino IDE > Library Manager):
  *   - Adafruit INA219 (adafruit) -- only used for begin()/getBusVoltage_V();
  *     current is read via a custom register write/read, see below.
@@ -143,6 +150,14 @@ unsigned long buttonLastChangeMs = 0;
 bool buttonLongPressFired = false;
 unsigned long buttonPressStartMs = 0;
 
+// Buzzer state (non-blocking tone sequencer -- see updateBuzzer())
+const uint16_t* activeBeepFreqs = nullptr;
+const uint16_t* activeBeepDurs  = nullptr;
+uint8_t activeBeepLen   = 0;
+uint8_t activeBeepIndex = 0;
+unsigned long beepStepStartMs = 0;
+bool beeping = false;
+
 // ------------------------------------------------------------------
 // Forward declarations
 // ------------------------------------------------------------------
@@ -160,6 +175,8 @@ void setStatusLed(uint8_t r, uint8_t g, uint8_t b);
 void ina219WriteCalibration(uint16_t calValue);
 int16_t ina219ReadRawCurrent();
 float readIna219CurrentA();
+void startBeepPattern(const uint16_t* freqs, const uint16_t* durs, uint8_t len);
+void updateBuzzer();
 float readSupplyVoltage();
 float readBatteryVoltage();
 
@@ -222,6 +239,40 @@ void updateStatusLedForState() {
     case STATE_DONE:       setStatusLed(0, STATUS_LED_BRIGHTNESS, 0); break;             // green
     case STATE_FAULT:      setStatusLed(STATUS_LED_BRIGHTNESS, 0, 0); break;             // red
   }
+}
+
+#define BEEP_LEN(arr) (sizeof(arr) / sizeof((arr)[0]))
+
+// ------------------------------------------------------------------
+// Piezo buzzer -- non-blocking tone sequencer. startBeepPattern() kicks
+// off a pattern (parallel frequency/duration arrays, see config.h.example
+// for the BUZZER_* patterns); updateBuzzer(), called every loop()
+// iteration, steps through it by elapsed time without ever blocking the
+// control loop or encoder handling. A frequency of 0 is a silent gap.
+// ------------------------------------------------------------------
+void startBeepPattern(const uint16_t* freqs, const uint16_t* durs, uint8_t len) {
+  if (!BUZZER_ENABLED || len == 0) return;
+  activeBeepFreqs = freqs;
+  activeBeepDurs = durs;
+  activeBeepLen = len;
+  activeBeepIndex = 0;
+  beepStepStartMs = millis();
+  beeping = true;
+  if (freqs[0] > 0) tone(BUZZER_PIN, freqs[0]); else noTone(BUZZER_PIN);
+}
+
+void updateBuzzer() {
+  if (!beeping) return;
+  if (millis() - beepStepStartMs < activeBeepDurs[activeBeepIndex]) return;
+  activeBeepIndex++;
+  if (activeBeepIndex >= activeBeepLen) {
+    noTone(BUZZER_PIN);
+    beeping = false;
+    return;
+  }
+  beepStepStartMs = millis();
+  uint16_t f = activeBeepFreqs[activeBeepIndex];
+  if (f > 0) tone(BUZZER_PIN, f); else noTone(BUZZER_PIN);
 }
 
 // ------------------------------------------------------------------
@@ -335,6 +386,7 @@ void startCharging() {
     faultReason = "No battery detected";
     chargeState = STATE_FAULT;
     updateStatusLedForState();
+    startBeepPattern(BUZZER_FAULT_FREQ_HZ, BUZZER_FAULT_DUR_MS, BEEP_LEN(BUZZER_FAULT_FREQ_HZ));
     Serial.printf("[charge] refusing to start: OCV=%.2fV below threshold\n", ocv);
     return;
   }
@@ -342,6 +394,7 @@ void startCharging() {
     faultReason = "Voltage already too high";
     chargeState = STATE_FAULT;
     updateStatusLedForState();
+    startBeepPattern(BUZZER_FAULT_FREQ_HZ, BUZZER_FAULT_DUR_MS, BEEP_LEN(BUZZER_FAULT_FREQ_HZ));
     Serial.printf("[charge] refusing to start: OCV=%.2fV at/above cutoff\n", ocv);
     return;
   }
@@ -363,6 +416,7 @@ void startCharging() {
   Serial.printf("[charge] START target=%.2fA ocv=%.2fV initialSoC=%.0f%%\n",
                 targetCurrentA, ocv, initialSocFraction * 100.0f);
   updateStatusLedForState();
+  startBeepPattern(BUZZER_START_FREQ_HZ, BUZZER_START_DUR_MS, BEEP_LEN(BUZZER_START_FREQ_HZ));
 }
 
 void stopCharging(ChargeState endState, const String &reason) {
@@ -372,6 +426,13 @@ void stopCharging(ChargeState endState, const String &reason) {
   faultReason = reason;
   Serial.printf("[charge] STOP -> %s (%s)\n", chargeStateName(endState), reason.c_str());
   updateStatusLedForState();
+  if (endState == STATE_DONE) {
+    startBeepPattern(BUZZER_DONE_FREQ_HZ, BUZZER_DONE_DUR_MS, BEEP_LEN(BUZZER_DONE_FREQ_HZ));
+  } else if (endState == STATE_FAULT) {
+    startBeepPattern(BUZZER_FAULT_FREQ_HZ, BUZZER_FAULT_DUR_MS, BEEP_LEN(BUZZER_FAULT_FREQ_HZ));
+  } else {
+    startBeepPattern(BUZZER_STOP_FREQ_HZ, BUZZER_STOP_DUR_MS, BEEP_LEN(BUZZER_STOP_FREQ_HZ));
+  }
 }
 
 // Called every CONTROL_LOOP_INTERVAL_MS. Reads the sensor, runs safety
@@ -663,6 +724,11 @@ void setup() {
   }
 #endif
 
+  if (BUZZER_ENABLED) {
+    pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   if (!ina219.begin()) {
     Serial.println("[ina219] FAILED to initialize -- check wiring/address");
@@ -686,6 +752,7 @@ void setup() {
 
 void loop() {
   handleEncoderAndButton();
+  updateBuzzer();
 
   unsigned long now = millis();
   if (now - lastControlLoopMs >= CONTROL_LOOP_INTERVAL_MS) {
