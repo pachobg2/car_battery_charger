@@ -1,0 +1,185 @@
+// Rename this file to config.h and fill in your real values.
+// config.h holds this device's full configuration -- credentials, identity,
+// and hardware settings. Keep it out of git (add it to .gitignore).
+#pragma once
+
+// ------------------------------------------------------------------
+// WiFi
+// ------------------------------------------------------------------
+#define WIFI_SSID     "your-wifi-ssid"
+#define WIFI_PASSWORD "your-wifi-password"
+
+// ------------------------------------------------------------------
+// MQTT broker
+// ------------------------------------------------------------------
+#define MQTT_HOST     "192.168.1.10"
+#define MQTT_PORT     1883
+#define MQTT_USER     "mqttuser"
+#define MQTT_PASSWORD "mqttpass"
+
+// ------------------------------------------------------------------
+// OTA (ArduinoOTA, Arduino IDE "Network Port")
+// ------------------------------------------------------------------
+#define OTA_PASSWORD  "choose-an-ota-password"
+
+// ------------------------------------------------------------------
+// Device identity
+// ------------------------------------------------------------------
+static const char* DEVICE_ID        = "car_battery_charger1"; // used in topics, unique_ids, NVS namespace
+static const char* DEVICE_NAME      = "Car Battery Charger";
+static const char* MANUFACTURER     = "P@cho";
+static const char* MODEL            = "CBC-1";
+static const char* FIRMWARE_VERSION = "1.0.0";
+
+// ------------------------------------------------------------------
+// Hardware -- I2C bus (INA219 current/voltage sensor + SH1106 OLED)
+// ------------------------------------------------------------------
+static const int I2C_SDA_PIN        = 4; // matches temp_humidity_sensor_v4's I2C pins
+static const int I2C_SCL_PIN        = 5;
+static const uint8_t INA219_I2C_ADDR = 0x40;
+static const uint8_t OLED_I2C_ADDR   = 0x3C;
+
+// ------------------------------------------------------------------
+// Hardware -- rotary encoder with push button
+// ------------------------------------------------------------------
+// A/B need to be interrupt-capable (any GPIO on ESP32-C3 qualifies). Wire
+// the encoder's common pin to GND and enable internal pull-ups (done in
+// firmware) rather than relying on the module having its own.
+static const int ENCODER_A_PIN  = 6;
+static const int ENCODER_B_PIN  = 7;
+static const int ENCODER_SW_PIN = 3;
+// Most cheap mechanical encoders produce 4 A/B edges per detent (click).
+// If a single click of your encoder moves the value by 4 steps instead of
+// 1, or does nothing, try 1 or 2 here.
+static const uint8_t ENCODER_EDGES_PER_DETENT = 4;
+
+// ------------------------------------------------------------------
+// Hardware -- onboard WS2812 status LED (matches smart_switch's GPIO10
+// convention on these ESP32-C3 boards). Set STATUS_LED_ENABLED to false
+// if your specific ESP32-C3-Zero variant doesn't have one on this pin.
+// ------------------------------------------------------------------
+static const bool STATUS_LED_ENABLED = true;
+static const int STATUS_LED_PIN      = 10;
+static const uint8_t STATUS_LED_BRIGHTNESS = 40; // 0-255, keep low -- it's a status dot, not a room light
+
+// ------------------------------------------------------------------
+// Hardware -- MOSFET gate drive (IRL540N run in its LINEAR region as a
+// variable resistor, not switched on/off -- there is no inductor/buck
+// stage in this design).
+//
+//   MOSFET_GATE_PIN --[100R gate resistor]--+-- IRL540N gate
+//                                            |
+//                              [2.2k]--------+
+//                                            |
+//                    filter cap [1uF] -------+-- IRL540N source/GND
+//                                            |
+//                              [10k pulldown]+-- IRL540N source/GND
+//
+// The 2.2k/1uF forms an RC low-pass (~72Hz cutoff) that turns the fast
+// GATE_PWM_FREQ_HZ PWM into a smooth analog gate bias; the 10k pulldown
+// guarantees the MOSFET is OFF while the ESP32 is booting/this pin is
+// floating, before setup() ever configures it.
+//
+// THERMAL WARNING: at a 26V supply this MOSFET dissipates
+// (26V - battery_voltage) * charge_current as HEAT continuously -- e.g.
+// ~54W at 4A into a 12.6V battery. It needs a substantial heatsink (and
+// ideally airflow) sized for MAX_CHARGE_CURRENT_A below, not just the
+// bare TO-220 tab. Lower MAX_CHARGE_CURRENT_A if your cooling can't keep
+// up -- the firmware has no thermal sensor on the MOSFET and cannot
+// detect it overheating.
+// ------------------------------------------------------------------
+static const int MOSFET_GATE_PIN          = 1;
+static const uint32_t GATE_PWM_FREQ_HZ    = 20000; // fast carrier, smoothed by the RC filter above
+static const uint8_t  GATE_PWM_RESOLUTION = 10;    // 0-1023 steps
+static const uint16_t GATE_PWM_MAX_DUTY   = (1 << GATE_PWM_RESOLUTION) - 1;
+
+// ------------------------------------------------------------------
+// Charge algorithm -- flooded/AGM lead-acid, 3-stage (bulk -> absorption
+// -> done). All voltages are at the battery terminals (INA219 bus
+// voltage), at typical ambient temperature -- no temperature compensation.
+// ------------------------------------------------------------------
+static const float SUPPLY_VOLTAGE       = 26.0f; // informational/sanity-check only
+static const float BULK_TARGET_VOLTAGE  = 14.4f; // bulk ends, absorption starts here
+static const float ABSORPTION_VOLTAGE   = 14.6f; // held constant during absorption
+static const float OVER_VOLTAGE_CUTOFF  = 15.0f; // immediate hard stop, any stage
+static const float NO_BATTERY_VOLTAGE_THRESHOLD = 8.0f; // below this at start = nothing plausible connected
+
+// Bulk-stage current as a fraction of capacity for "easy mode" (0.1 = C/10,
+// a conservative slow-charge rate safe for old/unknown-condition batteries).
+static const float BULK_CURRENT_FRACTION_OF_CAPACITY = 0.10f;
+// Hard ceiling on charge current regardless of capacity/manual setting --
+// see the thermal warning above. This is a firmware safety clamp, not just
+// a suggestion.
+//
+// Also capped by the INA219 itself: this sketch uses the Adafruit_INA219
+// library's default calibration (set inside ina219.begin(),
+// setCalibration_32V2A()), which only reads current accurately up to
+// ~3.2A on a standard 0.1 ohm shunt breakout -- above that the current
+// register saturates and readings (and therefore the control loop and the
+// over-current safety check) silently stop being trustworthy right at the
+// limit that matters most. Don't raise this past ~3.0A unless you also
+// add a custom INA219 calibration (smaller shunt resistor + matching
+// setCalibration() call) for real higher-current range.
+static const float MAX_CHARGE_CURRENT_A = 3.0f;
+
+// Absorption ends ("done") once current has stayed below this fraction of
+// the selected capacity for MIN_TERMINATION_DWELL_MS continuously.
+static const float TERMINATION_CURRENT_FRACTION  = 0.03f; // 3% of capacity
+static const uint32_t MIN_TERMINATION_DWELL_MS   = 5UL * 60 * 1000UL;   // 5 min
+static const uint32_t MIN_ABSORPTION_MS          = 20UL * 60 * 1000UL;  // don't allow "done" before this
+static const uint32_t MAX_CHARGE_DURATION_MS     = 14UL * 3600UL * 1000UL; // 14h absolute safety timeout
+// Independent hard-current-cutoff safety net (fires even if the control
+// loop itself misbehaves) -- current above MAX_CHARGE_CURRENT_A times this
+// factor, sustained, is treated as a fault (short/wiring problem), not a
+// control error to correct.
+static const float OVER_CURRENT_FAULT_FACTOR     = 1.25f;
+static const uint32_t OVER_CURRENT_FAULT_DWELL_MS = 1000UL;
+
+// Rough charge-efficiency factor applied to coulomb counting for the
+// state-of-charge estimate and ETA (lead-acid isn't 100% efficient --
+// some delivered current becomes heat/gassing, not stored charge).
+static const float CHARGE_EFFICIENCY = 0.85f;
+
+// ------------------------------------------------------------------
+// Easy-mode battery capacity presets (Ah) -- rotary-encoder selectable
+// ------------------------------------------------------------------
+static const uint16_t CAPACITY_PRESETS_AH[] = {44, 50, 55, 60, 65, 70, 80, 85, 90, 100};
+static const uint8_t CAPACITY_PRESETS_COUNT = sizeof(CAPACITY_PRESETS_AH) / sizeof(CAPACITY_PRESETS_AH[0]);
+static const uint8_t DEFAULT_CAPACITY_PRESET_INDEX = 3; // 60Ah, a common car-battery size
+
+// ------------------------------------------------------------------
+// Manual-mode current selection (encoder-adjustable when not using a
+// capacity preset)
+// ------------------------------------------------------------------
+static const float MANUAL_CURRENT_STEP_A = 0.1f;
+static const float MANUAL_CURRENT_MIN_A  = 0.2f;
+static const float DEFAULT_MANUAL_CURRENT_A = 1.0f;
+
+// ------------------------------------------------------------------
+// UI timing
+// ------------------------------------------------------------------
+static const uint32_t LONG_PRESS_MS       = 1500;
+static const uint32_t BUTTON_DEBOUNCE_MS  = 30;
+
+// ------------------------------------------------------------------
+// Control loop
+// ------------------------------------------------------------------
+static const uint32_t CONTROL_LOOP_INTERVAL_MS   = 100;  // current/voltage regulation update rate
+static const uint32_t DISPLAY_UPDATE_INTERVAL_MS = 250;
+static const uint32_t SOFT_START_RAMP_MS         = 3000; // ramp gate duty from 0 over this long on every (re)start
+// PI control gains on gate PWM duty (0-GATE_PWM_MAX_DUTY) vs the current
+// error (bulk stage) or voltage error (absorption stage). These are
+// starting points, not calibrated for your exact RC filter/MOSFET sample
+// -- if current oscillates, lower Kp; if it settles too slowly, raise Ki
+// a little. Tune with the Serial Monitor open (the control loop logs
+// error/duty every update).
+static const float BULK_KP    = 80.0f;  // duty counts per amp of error
+static const float BULK_KI    = 15.0f;  // duty counts per amp-second of accumulated error
+static const float ABS_KP     = 40.0f;  // duty counts per volt of error
+static const float ABS_KI     = 8.0f;   // duty counts per volt-second of accumulated error
+static const float PI_INTEGRAL_CLAMP = 400.0f; // anti-windup clamp on the integral term (duty counts)
+
+// ------------------------------------------------------------------
+// MQTT publish cadence for diagnostics (WiFi RSSI, reset reason, uptime)
+// ------------------------------------------------------------------
+static const uint32_t DIAG_INTERVAL_MS = 120000; // 2 min, matches the rest of the fleet
