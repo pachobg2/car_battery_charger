@@ -3,18 +3,29 @@
  *
  * 3-stage (bulk / absorption / done) charger for flooded/AGM car
  * batteries, built around:
- *   - INA219 (I2C) for bus voltage + charge current sensing, with a
- *     CUSTOM calibration for a 0.01 ohm / 25W shunt resistor (swapped in
- *     place of the breakout's stock 0.1 ohm shunt) for range up to ~10A.
- *     See config.h.example for how INA219_CALIBRATION/INA219_CURRENT_LSB_A
+ *   - INA219 (I2C) for charge current sensing, with a CUSTOM calibration
+ *     for a 0.01 ohm / 25W shunt resistor (swapped in place of the
+ *     breakout's stock 0.1 ohm shunt) for range up to ~10A. See
+ *     config.h.example for how INA219_CALIBRATION/INA219_CURRENT_LSB_A
  *     were computed, and the thermal warning on MAX_CHARGE_CURRENT_A.
+ *   - Battery VOLTAGE is NOT read from the INA219's bus-voltage register
+ *     -- the MOSFET bank's low-side placement (see below) means that
+ *     reading is the floating battery-negative return rail, not battery
+ *     voltage. Instead a second resistor divider into an ESP32 ADC pin
+ *     measures the supply rail, and battery_voltage = supply_measured -
+ *     ina219_bus_reading (see readBatteryVoltage() and the long comment
+ *     on SUPPLY_VOLTAGE_DIVIDER_PIN in config.h.example).
  *   - SH1106 128x64 OLED (I2C, via U8g2) for status/progress display
  *   - Rotary encoder with push button for local control
- *   - IRL540N MOSFET run in its LINEAR region (PWM through an RC filter
- *     onto the gate) as the current-regulating element -- there is no
- *     inductor/buck stage in this design. See config.h.example for the
- *     gate drive schematic and an important thermal warning: the MOSFET
- *     dissipates real, continuous heat and needs a proper heatsink.
+ *   - A bank of 4 parallel IRL540Ns (Q1-Q4), run in their LINEAR region
+ *     (PWM through an RC filter onto a shared gate bias) as the
+ *     current-regulating element -- there is no inductor/buck stage in
+ *     this design. Paralleled to split the heat one MOSFET can't handle
+ *     alone at this current; each has its own source ballast resistor
+ *     for current sharing (linear-mode paralleling needs this -- see
+ *     config.h.example for why). See config.h.example for the full gate
+ *     drive schematic and an important thermal warning either way: this
+ *     bank dissipates real, continuous heat and needs proper heatsinking.
  *
  * Standalone device -- no WiFi/MQTT/Home Assistant/OTA. Everything is
  * local: the OLED + rotary encoder are the only interface. Re-flashing
@@ -149,6 +160,8 @@ void setStatusLed(uint8_t r, uint8_t g, uint8_t b);
 void ina219WriteCalibration(uint16_t calValue);
 int16_t ina219ReadRawCurrent();
 float readIna219CurrentA();
+float readSupplyVoltage();
+float readBatteryVoltage();
 
 // ------------------------------------------------------------------
 // Helpers
@@ -245,6 +258,32 @@ float readIna219CurrentA() {
 }
 
 // ------------------------------------------------------------------
+// Supply-rail voltage sense (separate from the INA219) -- see the long
+// comment on SUPPLY_VOLTAGE_DIVIDER_PIN in config.h.example for why this
+// exists: the MOSFET bank's low-side placement means the INA219's own
+// bus-voltage reading is the battery-negative return rail, not battery
+// voltage. True battery voltage is computed as
+// (this reading) - (INA219 bus reading) in controlLoop()/startCharging().
+// analogReadMilliVolts() uses the ESP32's factory ADC calibration --
+// meaningfully more accurate than assuming a fixed 3.3V/4095 scale.
+// ------------------------------------------------------------------
+float readSupplyVoltage() {
+  uint32_t sumMv = 0;
+  for (uint8_t i = 0; i < SUPPLY_ADC_SAMPLES; i++) {
+    sumMv += analogReadMilliVolts(SUPPLY_VOLTAGE_DIVIDER_PIN);
+  }
+  float avgV = (sumMv / (float)SUPPLY_ADC_SAMPLES) / 1000.0f;
+  return avgV * SUPPLY_DIVIDER_RATIO;
+}
+
+// True battery terminal voltage -- see readSupplyVoltage()'s comment.
+float readBatteryVoltage() {
+  float supplyV = readSupplyVoltage();
+  float returnRailV = ina219.getBusVoltage_V();
+  return supplyV - returnRailV;
+}
+
+// ------------------------------------------------------------------
 // Persistence (NVS) -- only the last manual/easy-mode selection.
 // Charging itself never resumes automatically after a reboot.
 // ------------------------------------------------------------------
@@ -291,7 +330,7 @@ void startCharging() {
   // Take one reading with the MOSFET still off to sanity-check that a
   // battery is actually connected, and to seed the SoC estimate from its
   // resting voltage.
-  float ocv = ina219.getBusVoltage_V();
+  float ocv = readBatteryVoltage();
   if (ocv < NO_BATTERY_VOLTAGE_THRESHOLD) {
     faultReason = "No battery detected";
     chargeState = STATE_FAULT;
@@ -344,7 +383,7 @@ void controlLoop() {
   lastControlLoopMs = now;
   if (dtSec <= 0 || dtSec > 5.0f) dtSec = CONTROL_LOOP_INTERVAL_MS / 1000.0f; // guard first call / overflow
 
-  busVoltage = ina219.getBusVoltage_V();
+  busVoltage = readBatteryVoltage();
   busCurrent = max(0.0f, readIna219CurrentA()); // this design only ever sources current one way
 
   if (chargeState != STATE_BULK && chargeState != STATE_ABSORPTION) return;
@@ -632,6 +671,10 @@ void setup() {
   Serial.printf("[ina219] custom calibration=%u current_lsb=%.6fA/bit (0.01ohm shunt)\n",
                 INA219_CALIBRATION, INA219_CURRENT_LSB_A);
   u8g2.begin();
+
+  pinMode(SUPPLY_VOLTAGE_DIVIDER_PIN, INPUT);
+  Serial.printf("[supply] measured rail = %.2fV (calibrate SUPPLY_DIVIDER_RATIO against a multimeter)\n",
+                readSupplyVoltage());
 
   loadPersistedSettings();
   chargeState = STATE_IDLE; // never auto-resume charging after a reboot

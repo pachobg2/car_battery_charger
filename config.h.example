@@ -9,7 +9,7 @@
 // Device identity
 // ------------------------------------------------------------------
 static const char* DEVICE_ID        = "car_battery_charger1"; // NVS (Preferences) namespace
-static const char* FIRMWARE_VERSION = "1.1.0";
+static const char* FIRMWARE_VERSION = "1.2.0";
 
 // ------------------------------------------------------------------
 // Hardware -- I2C bus (INA219 current/voltage sensor + SH1106 OLED)
@@ -45,6 +45,44 @@ static const float INA219_CURRENT_LSB_A = 0.0004f; // 400uA/bit
 static const uint16_t INA219_CALIBRATION = 10240;
 
 // ------------------------------------------------------------------
+// Supply-rail voltage divider -- a SECOND, independent voltage sense,
+// needed because of how this design measures battery voltage. Read this
+// even if you skip other comments.
+//
+// The MOSFET bank sits in the battery's NEGATIVE return leg (needed so
+// their sources can be gate-driven straight from a ground-referenced
+// ESP32 GPIO -- see the gate-drive section below). That means the node
+// between the battery's negative terminal and the MOSFETs (call it the
+// "return rail") floats: as the battery charges from ~11.5V to ~14.6V,
+// the return rail's voltage relative to true system ground actually
+// FALLS from ~14.5V to ~11.4V (it's SUPPLY_VOLTAGE minus battery
+// voltage). The INA219's own bus-voltage reading is only ever relative
+// to its own GND pin -- which must be tied to true system ground for
+// I2C with the ESP32 to work at all -- so ina219.getBusVoltage_V() reads
+// THIS RETURN RAIL, not the battery's actual terminal voltage.
+//
+// Rather than trust a possibly-sagging/unregulated 26V supply as a fixed
+// constant to back-calculate from, this sketch measures the supply rail
+// directly with a second resistor divider into an ESP32 ADC pin, and
+// computes: battery_voltage = supply_rail_measured - ina219_bus_reading.
+// Both terms are ground-referenced measurements, so the subtraction is
+// robust even if your supply sags under load or isn't exactly 26V.
+//
+// Divider: SUPPLY+ --[110k]-- ADC pin --[10k]-- GND, plus a 100nF cap
+// from the ADC pin to GND to quiet the reading. At 26V this puts ~2.17V
+// on the ADC pin (comfortably inside the ESP32 ADC's accurate range);
+// at 30V, ~2.5V -- headroom if your supply runs a bit high.
+// SUPPLY_DIVIDER_RATIO = (110k + 10k) / 10k = 12.0 -- multiply the ADC's
+// calibrated millivolt reading by this to get the actual rail voltage.
+// This is a NOMINAL value from ideal resistor values; real resistors
+// have tolerance, so calibrate it against a multimeter reading on the
+// actual supply rail and adjust this constant until the Serial Monitor's
+// reported supply voltage matches.
+static const int SUPPLY_VOLTAGE_DIVIDER_PIN = 0; // ADC1_CH0
+static const float SUPPLY_DIVIDER_RATIO = 12.0f;
+static const uint8_t SUPPLY_ADC_SAMPLES = 16; // averaged per reading, to quiet ADC noise
+
+// ------------------------------------------------------------------
 // Hardware -- rotary encoder with push button
 // ------------------------------------------------------------------
 // A/B need to be interrupt-capable (any GPIO on ESP32-C3 qualifies). Wire
@@ -68,28 +106,58 @@ static const int STATUS_LED_PIN      = 10;
 static const uint8_t STATUS_LED_BRIGHTNESS = 40; // 0-255, keep low -- it's a status dot, not a room light
 
 // ------------------------------------------------------------------
-// Hardware -- MOSFET gate drive (IRL540N run in its LINEAR region as a
-// variable resistor, not switched on/off -- there is no inductor/buck
-// stage in this design).
+// Hardware -- MOSFET bank, run in its LINEAR region as a variable
+// resistor (not switched on/off) -- there is no inductor/buck stage in
+// this design. FOUR IRL540Ns in parallel (Q1-Q4), sharing the load, to
+// spread out the heat -- see the thermal comment on MAX_CHARGE_CURRENT_A
+// below for why one alone can't handle the 10A ceiling.
 //
-//   MOSFET_GATE_PIN --[100R gate resistor]--+-- IRL540N gate
-//                                            |
-//                              [2.2k]--------+
-//                                            |
-//                    filter cap [1uF] -------+-- IRL540N source/GND
-//                                            |
-//                              [10k pulldown]+-- IRL540N source/GND
+// Gate bias (shared by all four -- purely analog, one GPIO drives the
+// whole bank, no firmware changes needed for the parallel MOSFETs):
+//
+//   MOSFET_GATE_PIN --[2.2k]--+-------------------------- BIAS node
+//                             |
+//                         [1uF cap]
+//                             |
+//                            GND
+//   BIAS --[10k pulldown]-- GND
+//   BIAS --[100R]-- Q1 gate     BIAS --[100R]-- Q2 gate
+//   BIAS --[100R]-- Q3 gate     BIAS --[100R]-- Q4 gate
 //
 // The 2.2k/1uF forms an RC low-pass (~72Hz cutoff) that turns the fast
 // GATE_PWM_FREQ_HZ PWM into a smooth analog gate bias; the 10k pulldown
-// guarantees the MOSFET is OFF while the ESP32 is booting/this pin is
-// floating, before setup() ever configures it.
+// guarantees BIAS (and every gate) sits at 0V while the ESP32 is
+// booting/this pin is floating, before setup() ever configures it. Each
+// MOSFET gets its OWN 100R gate-stopper resistor off the shared BIAS
+// node -- paralleled MOSFET gates tied straight together are prone to
+// high-frequency parasitic oscillation; individual stoppers damp that.
 //
-// THERMAL WARNING: at a 26V supply this MOSFET dissipates
-// (26V - battery_voltage) * charge_current as HEAT continuously. It
-// needs a substantial heatsink (and ideally airflow) sized for
-// MAX_CHARGE_CURRENT_A below -- see that constant's own comment, the
-// numbers at 10A are serious.
+// Current sharing -- IMPORTANT, don't skip this: MOSFETs run in their
+// LINEAR region do NOT share current evenly on their own the way they
+// would as fully-saturated switches. A device that happens to run
+// slightly hotter conducts MORE current at the same Vgs (its threshold
+// voltage drops with temperature), which makes it run hotter still --
+// a positive feedback loop that can destroy one MOSFET while its
+// neighbors idle (thermal runaway). Each MOSFET's source therefore gets
+// its own small ballast resistor before the common return:
+//
+//   Q1 source --[0.22R 5W]--+
+//   Q2 source --[0.22R 5W]--+-- common return -- MAIN_SHUNT -- GND
+//   Q3 source --[0.22R 5W]--+
+//   Q4 source --[0.22R 5W]--+
+//
+// A device pulling more than its share drops more voltage across its
+// own ballast resistor, which reduces ITS OWN effective Vgs (gate is
+// common, source rises) and throttles it back down -- self-correcting
+// negative feedback. At ~2.5A/device (10A / 4), 0.22R drops ~0.55V
+// (enough for real balancing authority) and dissipates ~1.4W (use 5W
+// resistors for margin). Use MOSFETs from the same batch if you can --
+// matched Vgs(th) means less work for the ballast resistors to do.
+//
+// THERMAL WARNING: total dissipation across the whole bank is still
+// (supply_voltage - battery_voltage) * charge_current, same physics as
+// a single device -- paralleling only SPREADS that heat across more
+// packages, it doesn't reduce the total. See MAX_CHARGE_CURRENT_A below.
 // ------------------------------------------------------------------
 static const int MOSFET_GATE_PIN          = 1;
 static const uint32_t GATE_PWM_FREQ_HZ    = 20000; // fast carrier, smoothed by the RC filter above
@@ -98,10 +166,12 @@ static const uint16_t GATE_PWM_MAX_DUTY   = (1 << GATE_PWM_RESOLUTION) - 1;
 
 // ------------------------------------------------------------------
 // Charge algorithm -- flooded/AGM lead-acid, 3-stage (bulk -> absorption
-// -> done). All voltages are at the battery terminals (INA219 bus
-// voltage), at typical ambient temperature -- no temperature compensation.
+// -> done). All voltages are at the battery terminals (the computed
+// battery_voltage = supply_rail_measured - ina219_bus_reading described
+// above, not the raw INA219 bus reading), at typical ambient temperature
+// -- no temperature compensation.
 // ------------------------------------------------------------------
-static const float SUPPLY_VOLTAGE       = 26.0f; // informational/sanity-check only
+static const float SUPPLY_VOLTAGE       = 26.0f; // nominal only -- the real supply rail is measured, see above
 static const float BULK_TARGET_VOLTAGE  = 14.4f; // bulk ends, absorption starts here
 static const float ABSORPTION_VOLTAGE   = 14.6f; // held constant during absorption
 static const float OVER_VOLTAGE_CUTOFF  = 15.0f; // immediate hard stop, any stage
@@ -115,23 +185,19 @@ static const float BULK_CURRENT_FRACTION_OF_CAPACITY = 0.10f;
 
 // Hard ceiling on charge current regardless of capacity/manual setting.
 //
-// Sensor-side, this is a non-issue now: the custom calibration above
-// reads accurately to ~13A. The REAL ceiling is thermal. At a 26V supply,
-// a battery sitting at its lowest resting voltage (~11-12V) is exactly
-// when charge current -- and therefore MOSFET voltage drop -- is
-// highest. At 10A into an 11.5V battery: (26 - 11.5) * 10 = ~145W,
-// continuously, in a single TO-220 IRL540N. That is beyond what one
-// TO-220 package can shed even on a large finned heatsink with a fan --
-// realistic sustained dissipation for one TO-220 device on good cooling
-// tops out around 40-60W. To actually run near 10A you need either
-// multiple IRL540Ns in parallel sharing the load (with gate resistors
-// per device, not just paralleled gates), or accept that 10A only stays
-// safe once the battery has already come up closer to BULK_TARGET_VOLTAGE
-// (less voltage drop, less heat) -- not at the start of a bulk charge on
-// a deeply discharged battery, which is precisely when easy-mode picks
-// this current. Watch the MOSFET's case temperature on first use with a
-// preset anywhere near this ceiling; back MAX_CHARGE_CURRENT_A off if
-// it's climbing past what your heatsink can hold in steady state.
+// Sensor-side, this is a non-issue: the custom calibration above reads
+// accurately to ~13A. The REAL ceiling is thermal. At a 26V supply, a
+// battery sitting at its lowest resting voltage (~11.5V) is exactly when
+// charge current -- and therefore MOSFET voltage drop -- is highest:
+// (26 - 11.5) * 10 = ~145W total, continuously, split across the 4
+// paralleled MOSFETs in the bank above -- about 36W each in the worst
+// case (start of a bulk charge on a deeply discharged battery, which is
+// exactly when easy-mode picks the highest current). 36W per TO-220 is
+// realistic on a real heatsink with airflow, but it's not casual --
+// watch case temperature on first use anywhere near this ceiling, and
+// back this off (or add more parallel MOSFETs) if it's climbing past
+// what your cooling can hold in steady state. If you build with fewer
+// than 4 MOSFETs, lower this proportionally.
 static const float MAX_CHARGE_CURRENT_A = 10.0f;
 
 // Absorption ends ("done") once current has stayed below this fraction of

@@ -1,13 +1,17 @@
 # Car Battery Charger — ESP32-C3-Zero smart lead-acid charger
 
 Standalone smart charger for flooded/AGM 12V car batteries (44-100Ah).
-No WiFi/MQTT/cloud/OTA — everything is local: an INA219 current/voltage
-sensor, a SH1106 128x64 OLED, and a rotary encoder with push button are
-the entire interface. Re-flashing always needs a USB cable.
+No WiFi/MQTT/cloud/OTA — everything is local: an INA219 current sensor,
+a second ADC-based supply-voltage sense, a SH1106 128x64 OLED, and a
+rotary encoder with push button are the entire interface. Re-flashing
+always needs a USB cable.
 
-**Read the Hardware and Safety sections below before wiring this up.**
-This design regulates charge current by running an IRL540N MOSFET in its
-*linear* region — it gets hot, on purpose, and needs a real heatsink.
+**Read the Hardware section below before wiring this up.** This design
+regulates charge current by running a bank of 4 parallel IRL540N MOSFETs
+in their *linear* region — they get hot, on purpose, and need real
+heatsinking. The voltage-sensing topology is also less obvious than it
+looks; see "Voltage sensing" below before you assume the INA219 reads
+battery voltage directly.
 
 ## Files
 
@@ -47,68 +51,121 @@ There's no OTA in this build — flash over USB every time.
 | Encoder A | GPIO6 | interrupt-driven quadrature |
 | Encoder B | GPIO7 | |
 | Encoder button | GPIO3 | active low, internal pull-up |
-| MOSFET gate (via RC filter) | GPIO1 | LEDC PWM, 20kHz carrier |
+| MOSFET gate bias (via RC filter, feeds all 4 gates) | GPIO1 | LEDC PWM, 20kHz carrier |
+| Supply-rail voltage divider | GPIO0 | ADC1_CH0, see Voltage sensing below |
 | Status LED (onboard WS2812) | GPIO10 | matches `smart_switch`'s convention |
 
 Avoid the ESP32-C3 strapping pins (GPIO2, 8, 9) for anything with an
 external pull resistor or load on it — GPIO9 is also the BOOT button on
 most dev boards.
 
-### MOSFET gate drive — read this before wiring
+### Voltage sensing — read this before wiring, it changes the topology
 
-The IRL540N is run as a **linear** current-regulating element, not
-switched fully on/off — there is no inductor or buck stage in this
-design. The ESP32 PWMs its gate through an RC low-pass filter, turning
-the fast PWM carrier into a smooth analog bias voltage that partially
-enhances the MOSFET, so it behaves like a variable resistor:
+Battery voltage is **not** read from the INA219's bus-voltage register.
+The MOSFET bank has to sit in the battery's negative return leg (so its
+gates can be driven straight from a ground-referenced ESP32 GPIO — see
+below), which means the node between the battery's negative terminal and
+the MOSFETs actually floats: as the battery charges from ~11.5V to
+~14.6V, that node's voltage *relative to true system ground* falls from
+~14.5V to ~11.4V (it's the supply voltage minus the battery voltage).
+The INA219's bus-voltage reading is always relative to its own GND pin —
+which has to share system ground with the ESP32 for I2C to work — so
+`getBusVoltage_V()` reads that floating return node, not battery voltage.
+
+The fix: a second, independent resistor divider (`SUPPLY+ --[110k]--
+ADC pin --[10k]-- GND`, plus a 100nF cap to ground) feeds ESP32 ADC1_CH0
+(GPIO0), measuring the actual supply rail. Firmware computes:
 
 ```
-MOSFET_GATE_PIN --[100R gate resistor]--+-- IRL540N gate
-                                         |
-                           [2.2k]--------+
-                                         |
-                 filter cap [1uF] -------+-- IRL540N source/GND
-                                         |
-                           [10k pulldown]+-- IRL540N source/GND
+battery_voltage = supply_rail_measured − ina219_bus_reading
+```
+
+Both terms are ground-referenced, so this stays accurate even if the 26V
+supply sags under load or isn't exactly 26V — which mattered enough to
+fix, since the charge algorithm's thresholds are 0.2V apart (14.4V vs
+14.6V). `SUPPLY_DIVIDER_RATIO` in `config.h` (12.0 nominal) should be
+calibrated against a multimeter reading on the real supply rail; the
+Serial Monitor prints the measured rail voltage at boot.
+
+The INA219 itself is used **only for current sensing** now (via its
+shunt, using the custom calibration described below) — its bus-voltage
+feature plays no role in the charge algorithm.
+
+### MOSFET bank — 4x IRL540N in parallel, current-shared
+
+Run in their **linear** region as variable resistors, not switched fully
+on/off — there's no inductor or buck stage in this design. One shared
+gate-bias network drives all four (purely analog — no firmware change
+needed to add MOSFETs):
+
+```
+MOSFET_GATE_PIN --[2.2k]--+------------------------------ BIAS node
+                          |
+                      [1uF cap]
+                          |
+                         GND
+BIAS --[10k pulldown]-- GND
+BIAS --[100R]-- Q1 gate      BIAS --[100R]-- Q2 gate
+BIAS --[100R]-- Q3 gate      BIAS --[100R]-- Q4 gate
 ```
 
 The 2.2k/1uF RC forms a ~72Hz low-pass — well below the 20kHz PWM
 carrier (so ripple is filtered out) and well above the ~10Hz control-loop
-update rate (so it still responds promptly). The 10k gate pulldown
-guarantees the MOSFET stays OFF while the ESP32 is booting or if this
-GPIO is ever left floating, before `setup()` configures it.
+update rate (so it still responds promptly). The 10k pulldown guarantees
+every gate sits at 0V while the ESP32 boots or if the GPIO floats, before
+`setup()` configures it. Each MOSFET gets its own 100R gate-stopper
+resistor off the shared BIAS node — tying paralleled gates straight
+together invites high-frequency parasitic oscillation between devices.
 
-Power path: 26V DC supply → battery+ → battery− → MOSFET drain → MOSFET
-source → GND, with the INA219 (and its 0.01Ω sense resistor, see below)
-in series to measure charge current — either in the battery+ or
-battery− leg, matching how your INA219 breakout's IN+/IN− are wired.
-The firmware assumes current always flows one direction, into the
-battery.
+**Current sharing matters here, and it's not automatic.** MOSFETs in
+their linear region don't share current evenly on their own: a device
+running slightly hotter conducts *more* current at the same Vgs (its
+threshold voltage drops with temperature), which heats it further —
+thermal runaway that can destroy one MOSFET while its neighbors barely
+warm up. Each MOSFET's source gets its own small ballast resistor before
+the common return:
+
+```
+Q1 source --[0.22R 5W]--+
+Q2 source --[0.22R 5W]--+-- common return -- 0.01R main shunt -- GND
+Q3 source --[0.22R 5W]--+
+Q4 source --[0.22R 5W]--+
+```
+
+A device pulling more than its share drops more voltage across its own
+ballast resistor, which lowers *its own* effective Vgs (gate is shared,
+source rises) and throttles it back — self-correcting negative feedback.
+At ~2.5A/device (10A ÷ 4), 0.22Ω drops ~0.55V (real balancing authority)
+and dissipates ~1.4W (use 5W resistors for margin). Matched MOSFETs from
+the same batch help too — less imbalance for the ballast resistors to
+correct.
+
+Power path: 26V DC supply → battery+ → battery− → the four MOSFET
+drains (paralleled) → each MOSFET's own ballast resistor → common
+return → the 0.01Ω/25W main current shunt → supply/system ground. The
+INA219's VIN+/VIN− sense directly across that main shunt's two leads
+(Kelvin-style — wire the sense leads to the resistor's own terminals,
+not through the high-current power lugs, or shunt-lead resistance will
+skew the reading).
 
 ### Thermal warning — read this even if you skip everything else
 
-At a 26V supply, the MOSFET dissipates
-`(26V − battery_voltage) × charge_current` as heat, continuously. A
-deeply discharged battery sitting at ~11.5V, charging at the 10A ceiling
-this firmware now allows: `(26 − 11.5) × 10 ≈ 145W` — **continuously, in
-a single TO-220 package.** That is beyond what one TO-220 IRL540N can
-realistically shed even on a large finned heatsink with a fan (realistic
-sustained dissipation for one TO-220 device on good cooling tops out
-around 40–60W). To actually run near 10A safely you need either:
+Total dissipation across the whole bank is still
+`(supply_voltage − battery_voltage) × charge_current`, same physics as a
+single device — paralleling only **spreads** that heat, it doesn't
+reduce it. A deeply discharged battery sitting at ~11.5V, charging at
+the 10A ceiling this firmware allows: `(26 − 11.5) × 10 ≈ 145W` total —
+about **36W per MOSFET** across the 4-way bank, worst case, right at the
+start of a bulk charge (exactly when easy-mode picks the highest
+current). 36W per TO-220 is realistic on a real heatsink with airflow,
+but it's not casual — this is not a "bolt on any old heatsink" build.
 
-- multiple IRL540Ns in parallel sharing the load (with a gate resistor
-  per device, not just tied gates), or
-- accept that high current is only safe once the battery has already
-  come up closer to `BULK_TARGET_VOLTAGE` (less voltage drop, less
-  heat) — not at the start of a bulk charge on a deeply discharged
-  battery, which is exactly when easy-mode picks the highest current.
-
-The firmware has **no thermal sensor on the MOSFET** and cannot detect
-it overheating. Watch the case temperature by hand (or an IR thermometer)
-on first use at any current setting near the ceiling, and lower
-`MAX_CHARGE_CURRENT_A` in `config.h` if it's climbing past what your
-cooling can hold in steady state. `10.0f` is a sensor-range ceiling, not
-a target to aim for.
+The firmware has **no thermal sensor** on the MOSFETs and cannot detect
+overheating. Watch case temperature by hand (or an IR thermometer) on
+first use anywhere near the current ceiling, and back `MAX_CHARGE_CURRENT_A`
+off — or add more parallel MOSFETs — if it's climbing past what your
+cooling holds in steady state. If you build with fewer than 4 MOSFETs,
+lower `MAX_CHARGE_CURRENT_A` proportionally in `config.h`.
 
 ### INA219 custom calibration (0.01Ω / 25W shunt, up to ~10A)
 
@@ -118,8 +175,7 @@ library only ships fixed calibration presets tuned for the stock 0.1Ω
 shunt, so its `getCurrent_mA()` would silently read 10x too low with this
 resistor — instead, the sketch writes the INA219's calibration register
 directly and reads the raw current register itself, scaled by its own
-`INA219_CURRENT_LSB_A`. Bus voltage (`getBusVoltage_V()`) is unaffected
-by this and still uses the library normally.
+`INA219_CURRENT_LSB_A`.
 
 Values used (see the derivation comment in `config.h.example` for the
 full calculation): `INA219_CURRENT_LSB_A = 0.0004` (400µA/bit),
@@ -215,3 +271,4 @@ unattended.
 |---|---|---|
 | v1.0.0 | 2026-09-18 | Initial firmware: 3-stage (bulk/absorption/done) lead-acid charging via linear-region IRL540N control, INA219 sensing, SH1106 OLED status/progress display, rotary-encoder local UI with easy-mode capacity presets, MQTT + Home Assistant discovery, ArduinoOTA. |
 | v1.1.0 | 2026-09-18 | Removed MQTT/Home Assistant connectivity and ArduinoOTA entirely -- standalone local-only device now (encoder + OLED only), no WiFi. Added a custom INA219 calibration for a 0.01 ohm/25W shunt resistor (replacing the breakout's stock 0.1 ohm shunt), raising accurate current range to ~13A and `MAX_CHARGE_CURRENT_A` to 10A; added a throttled Serial tuning log to the control loop. |
+| v1.2.0 | 2026-09-18 | Fixed a battery-voltage measurement bug: the INA219's bus-voltage reading is the floating MOSFET-side return rail, not battery voltage, given the low-side MOSFET placement -- added a second resistor divider into an ESP32 ADC pin (GPIO0) to measure the actual supply rail, and compute battery voltage as supply_measured minus the INA219 bus reading. Also moved the MOSFET stage to a bank of 4 parallel IRL540Ns with per-device source ballast resistors for current sharing, spreading the ~145W worst-case dissipation at the 10A ceiling across multiple packages. |
