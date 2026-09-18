@@ -1,35 +1,15 @@
-// Rename this file to config.h and fill in your real values.
-// config.h holds this device's full configuration -- credentials, identity,
-// and hardware settings. Keep it out of git (add it to .gitignore).
+// Rename this file to config.h and adjust if needed.
+// config.h holds this device's full configuration -- identity and
+// hardware settings. No WiFi/MQTT/cloud credentials here: this is a
+// standalone device, no networking. Keep it out of git (add it to
+// .gitignore) in case you ever add something sensitive to it.
 #pragma once
-
-// ------------------------------------------------------------------
-// WiFi
-// ------------------------------------------------------------------
-#define WIFI_SSID     "your-wifi-ssid"
-#define WIFI_PASSWORD "your-wifi-password"
-
-// ------------------------------------------------------------------
-// MQTT broker
-// ------------------------------------------------------------------
-#define MQTT_HOST     "192.168.1.10"
-#define MQTT_PORT     1883
-#define MQTT_USER     "mqttuser"
-#define MQTT_PASSWORD "mqttpass"
-
-// ------------------------------------------------------------------
-// OTA (ArduinoOTA, Arduino IDE "Network Port")
-// ------------------------------------------------------------------
-#define OTA_PASSWORD  "choose-an-ota-password"
 
 // ------------------------------------------------------------------
 // Device identity
 // ------------------------------------------------------------------
-static const char* DEVICE_ID        = "car_battery_charger1"; // used in topics, unique_ids, NVS namespace
-static const char* DEVICE_NAME      = "Car Battery Charger";
-static const char* MANUFACTURER     = "P@cho";
-static const char* MODEL            = "CBC-1";
-static const char* FIRMWARE_VERSION = "1.0.0";
+static const char* DEVICE_ID        = "car_battery_charger1"; // NVS (Preferences) namespace
+static const char* FIRMWARE_VERSION = "1.1.0";
 
 // ------------------------------------------------------------------
 // Hardware -- I2C bus (INA219 current/voltage sensor + SH1106 OLED)
@@ -38,6 +18,31 @@ static const int I2C_SDA_PIN        = 4; // matches temp_humidity_sensor_v4's I2
 static const int I2C_SCL_PIN        = 5;
 static const uint8_t INA219_I2C_ADDR = 0x40;
 static const uint8_t OLED_I2C_ADDR   = 0x3C;
+
+// ------------------------------------------------------------------
+// INA219 custom shunt calibration -- 0.01 ohm / 25W shunt resistor
+// (swapped in place of the breakout's stock 0.1 ohm shunt) for range up
+// to ~10A. The Adafruit_INA219 library only ships fixed presets
+// (setCalibration_32V2A/32V1A/16V400mA) tuned for a 0.1 ohm shunt, so its
+// getCurrent_mA() would silently use the wrong scale factor here -- the
+// sketch instead writes the calibration register itself and reads the
+// raw current register directly, scaled by INA219_CURRENT_LSB_A below.
+//
+// Derived per the INA219 datasheet's calibration procedure, for
+// Max_Expected_Current = 10A and R_SHUNT = 0.01 ohm:
+//   Current_LSB = 10A / 32767 = 305.2 uA/bit, rounded up to a clean
+//                 400 uA/bit for headroom to ~13.1A before the current
+//                 register overflows.
+//   Calibration = trunc(0.04096 / (Current_LSB * R_SHUNT))
+//               = trunc(0.04096 / (0.0004 * 0.01)) = 10240
+// Shunt voltage at 10A = 10A * 0.01ohm = 100mV, comfortably inside the
+// INA219's default +-320mV PGA range -- no gain change needed.
+//
+// If you change the shunt resistor or the current range you want,
+// recompute BOTH constants below together -- they only make sense as a
+// matched pair.
+static const float INA219_CURRENT_LSB_A = 0.0004f; // 400uA/bit
+static const uint16_t INA219_CALIBRATION = 10240;
 
 // ------------------------------------------------------------------
 // Hardware -- rotary encoder with push button
@@ -81,12 +86,10 @@ static const uint8_t STATUS_LED_BRIGHTNESS = 40; // 0-255, keep low -- it's a st
 // floating, before setup() ever configures it.
 //
 // THERMAL WARNING: at a 26V supply this MOSFET dissipates
-// (26V - battery_voltage) * charge_current as HEAT continuously -- e.g.
-// ~54W at 4A into a 12.6V battery. It needs a substantial heatsink (and
-// ideally airflow) sized for MAX_CHARGE_CURRENT_A below, not just the
-// bare TO-220 tab. Lower MAX_CHARGE_CURRENT_A if your cooling can't keep
-// up -- the firmware has no thermal sensor on the MOSFET and cannot
-// detect it overheating.
+// (26V - battery_voltage) * charge_current as HEAT continuously. It
+// needs a substantial heatsink (and ideally airflow) sized for
+// MAX_CHARGE_CURRENT_A below -- see that constant's own comment, the
+// numbers at 10A are serious.
 // ------------------------------------------------------------------
 static const int MOSFET_GATE_PIN          = 1;
 static const uint32_t GATE_PWM_FREQ_HZ    = 20000; // fast carrier, smoothed by the RC filter above
@@ -106,21 +109,30 @@ static const float NO_BATTERY_VOLTAGE_THRESHOLD = 8.0f; // below this at start =
 
 // Bulk-stage current as a fraction of capacity for "easy mode" (0.1 = C/10,
 // a conservative slow-charge rate safe for old/unknown-condition batteries).
+// Deliberately matches the 100Ah preset to exactly 10A -- the reason
+// MAX_CHARGE_CURRENT_A below was raised to 10A in the first place.
 static const float BULK_CURRENT_FRACTION_OF_CAPACITY = 0.10f;
-// Hard ceiling on charge current regardless of capacity/manual setting --
-// see the thermal warning above. This is a firmware safety clamp, not just
-// a suggestion.
+
+// Hard ceiling on charge current regardless of capacity/manual setting.
 //
-// Also capped by the INA219 itself: this sketch uses the Adafruit_INA219
-// library's default calibration (set inside ina219.begin(),
-// setCalibration_32V2A()), which only reads current accurately up to
-// ~3.2A on a standard 0.1 ohm shunt breakout -- above that the current
-// register saturates and readings (and therefore the control loop and the
-// over-current safety check) silently stop being trustworthy right at the
-// limit that matters most. Don't raise this past ~3.0A unless you also
-// add a custom INA219 calibration (smaller shunt resistor + matching
-// setCalibration() call) for real higher-current range.
-static const float MAX_CHARGE_CURRENT_A = 3.0f;
+// Sensor-side, this is a non-issue now: the custom calibration above
+// reads accurately to ~13A. The REAL ceiling is thermal. At a 26V supply,
+// a battery sitting at its lowest resting voltage (~11-12V) is exactly
+// when charge current -- and therefore MOSFET voltage drop -- is
+// highest. At 10A into an 11.5V battery: (26 - 11.5) * 10 = ~145W,
+// continuously, in a single TO-220 IRL540N. That is beyond what one
+// TO-220 package can shed even on a large finned heatsink with a fan --
+// realistic sustained dissipation for one TO-220 device on good cooling
+// tops out around 40-60W. To actually run near 10A you need either
+// multiple IRL540Ns in parallel sharing the load (with gate resistors
+// per device, not just paralleled gates), or accept that 10A only stays
+// safe once the battery has already come up closer to BULK_TARGET_VOLTAGE
+// (less voltage drop, less heat) -- not at the start of a bulk charge on
+// a deeply discharged battery, which is precisely when easy-mode picks
+// this current. Watch the MOSFET's case temperature on first use with a
+// preset anywhere near this ceiling; back MAX_CHARGE_CURRENT_A off if
+// it's climbing past what your heatsink can hold in steady state.
+static const float MAX_CHARGE_CURRENT_A = 10.0f;
 
 // Absorption ends ("done") once current has stayed below this fraction of
 // the selected capacity for MIN_TERMINATION_DWELL_MS continuously.
@@ -178,8 +190,3 @@ static const float BULK_KI    = 15.0f;  // duty counts per amp-second of accumul
 static const float ABS_KP     = 40.0f;  // duty counts per volt of error
 static const float ABS_KI     = 8.0f;   // duty counts per volt-second of accumulated error
 static const float PI_INTEGRAL_CLAMP = 400.0f; // anti-windup clamp on the integral term (duty counts)
-
-// ------------------------------------------------------------------
-// MQTT publish cadence for diagnostics (WiFi RSSI, reset reason, uptime)
-// ------------------------------------------------------------------
-static const uint32_t DIAG_INTERVAL_MS = 120000; // 2 min, matches the rest of the fleet

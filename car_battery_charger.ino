@@ -3,7 +3,11 @@
  *
  * 3-stage (bulk / absorption / done) charger for flooded/AGM car
  * batteries, built around:
- *   - INA219 (I2C) for bus voltage + charge current sensing
+ *   - INA219 (I2C) for bus voltage + charge current sensing, with a
+ *     CUSTOM calibration for a 0.01 ohm / 25W shunt resistor (swapped in
+ *     place of the breakout's stock 0.1 ohm shunt) for range up to ~10A.
+ *     See config.h.example for how INA219_CALIBRATION/INA219_CURRENT_LSB_A
+ *     were computed, and the thermal warning on MAX_CHARGE_CURRENT_A.
  *   - SH1106 128x64 OLED (I2C, via U8g2) for status/progress display
  *   - Rotary encoder with push button for local control
  *   - IRL540N MOSFET run in its LINEAR region (PWM through an RC filter
@@ -11,11 +15,10 @@
  *     inductor/buck stage in this design. See config.h.example for the
  *     gate drive schematic and an important thermal warning: the MOSFET
  *     dissipates real, continuous heat and needs a proper heatsink.
- *   - espMqttClient + Home Assistant MQTT discovery, matching the rest
- *     of this fleet, so the charger can also be monitored/controlled
- *     remotely (voltage/current/state/SoC sensors, target-current
- *     number, capacity select, start/stop buttons)
- *   - ArduinoOTA for wireless updates after the first USB flash
+ *
+ * Standalone device -- no WiFi/MQTT/Home Assistant/OTA. Everything is
+ * local: the OLED + rotary encoder are the only interface. Re-flashing
+ * always needs a USB cable.
  *
  * Charge algorithm (flooded/AGM lead-acid):
  *   BULK: constant current (targetCurrentA) until battery reaches
@@ -38,21 +41,17 @@
  * current from BULK_CURRENT_FRACTION_OF_CAPACITY).
  *
  * Libraries needed (Arduino IDE > Library Manager):
- *   - espMqttClient (bertmelis)
- *   - Adafruit INA219 (adafruit)
+ *   - Adafruit INA219 (adafruit) -- only used for begin()/getBusVoltage_V();
+ *     current is read via a custom register write/read, see below.
  *   - U8g2 (olikraus)
  *   - Adafruit NeoPixel (adafruit) -- only if STATUS_LED_ENABLED
- *   Built-in / come with the ESP32 Arduino core: WiFi, ArduinoOTA,
- *   Preferences, Wire
+ *   Built-in / come with the ESP32 Arduino core: Preferences, Wire
  *
  * Board package: esp32 by Espressif Systems -- board "ESP32C3 Dev
- * Module". Rename config.h.example -> config.h and fill in your
- * WiFi/MQTT/OTA credentials and hardware pins before building.
+ * Module". Rename config.h.example -> config.h and fill in your hardware
+ * pins/algorithm constants before building.
  */
 
-#include <WiFi.h>
-#include <ArduinoOTA.h>
-#include <espMqttClient.h>
 #include <Preferences.h>
 #include <esp_system.h>
 #include <Wire.h>
@@ -85,7 +84,6 @@ enum UiMode { UI_MAIN, UI_SELECT_CAPACITY };
 // ------------------------------------------------------------------
 // Globals
 // ------------------------------------------------------------------
-espMqttClient mqttClient;
 Preferences prefs;
 Adafruit_INA219 ina219(INA219_I2C_ADDR);
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /*reset=*/U8X8_PIN_NONE);
@@ -115,9 +113,8 @@ unsigned long belowTerminationSinceMs = 0; // 0 = not currently below threshold
 unsigned long overCurrentFaultSinceMs = 0; // 0 = not currently over
 
 uint16_t gateDuty = 0;          // current commanded duty, 0..GATE_PWM_MAX_DUTY
-uint16_t softStartTargetDuty = 0;
-unsigned long softStartBeginMs = 0;
 bool softStarting = false;
+unsigned long softStartBeginMs = 0;
 
 float piIntegral = 0.0f; // shared integral accumulator, reset on every stage/charge transition
 
@@ -135,61 +132,9 @@ unsigned long buttonLastChangeMs = 0;
 bool buttonLongPressFired = false;
 unsigned long buttonPressStartMs = 0;
 
-// mqtt reconnect / diagnostics
-unsigned long lastMqttAttemptMs = 0;
-unsigned long mqttBackoffMs     = 1000;
-static const unsigned long MQTT_BACKOFF_MAX_MS = 30000;
-uint32_t mqttFailCount = 0;
-bool     everConnected = false;
-unsigned long lastDiagPublishMs = 0;
-
-// wifi reconnect state (non-blocking)
-bool          wifiConnectInProgress = false;
-unsigned long wifiConnectStartMs    = 0;
-static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
-
-// ------------------------------------------------------------------
-// MQTT / discovery topics
-// ------------------------------------------------------------------
-String baseTopic               = String("charger/") + DEVICE_ID;
-String availabilityTopic       = baseTopic + "/availability";
-String stateTopic              = baseTopic + "/state";               // Idle/Bulk/Absorption/Done/Fault
-String voltageTopic            = baseTopic + "/voltage/state";
-String currentTopic            = baseTopic + "/current/state";
-String socTopic                = baseTopic + "/soc/state";
-String ahDeliveredTopic        = baseTopic + "/ah_delivered/state";
-String faultTopic              = baseTopic + "/fault/state";
-String targetCurrentStateTopic = baseTopic + "/target_current/state";
-String targetCurrentCmdTopic   = baseTopic + "/target_current/set";
-String capacityStateTopic      = baseTopic + "/capacity/state";
-String capacityCmdTopic        = baseTopic + "/capacity/set";
-String startCmdTopic           = baseTopic + "/start";
-String stopCmdTopic            = baseTopic + "/stop";
-String wifiSignalTopic         = baseTopic + "/wifi_signal/state";
-String resetReasonTopic        = baseTopic + "/reset_reason/state";
-String failCountTopic          = baseTopic + "/mqtt_fail_count/state";
-String uptimeTopic             = baseTopic + "/uptime/state";
-
-String discoverySensorPrefix   = String("homeassistant/sensor/") + DEVICE_ID + "_";
-String discoveryNumberPrefix   = String("homeassistant/number/") + DEVICE_ID + "_";
-String discoverySelectPrefix   = String("homeassistant/select/") + DEVICE_ID + "_";
-String discoveryButtonPrefix   = String("homeassistant/button/") + DEVICE_ID + "_";
-
 // ------------------------------------------------------------------
 // Forward declarations
 // ------------------------------------------------------------------
-void connectWifi();
-void maintainWifi();
-bool checkedPublish(const String &topic, uint8_t qos, bool retain, const String &payload);
-void connectMqtt();
-void onMqttConnect(bool sessionPresent);
-void onMqttDisconnect(espMqttClientTypes::DisconnectReason reason);
-void onMqttMessage(const espMqttClientTypes::MessageProperties& properties,
-                    const char* topic, const uint8_t* payload, size_t len,
-                    size_t index, size_t total);
-void publishDiscovery();
-void publishChargeState();
-void publishDiagnostics(bool force);
 String resetReasonString();
 void startCharging();
 void stopCharging(ChargeState endState, const String &reason);
@@ -201,6 +146,9 @@ float estimateSocFromOcv(float v);
 void loadPersistedSettings();
 void savePersistedSettings();
 void setStatusLed(uint8_t r, uint8_t g, uint8_t b);
+void ina219WriteCalibration(uint16_t calValue);
+int16_t ina219ReadRawCurrent();
+float readIna219CurrentA();
 
 // ------------------------------------------------------------------
 // Helpers
@@ -261,6 +209,39 @@ void updateStatusLedForState() {
     case STATE_DONE:       setStatusLed(0, STATUS_LED_BRIGHTNESS, 0); break;             // green
     case STATE_FAULT:      setStatusLed(STATUS_LED_BRIGHTNESS, 0, 0); break;             // red
   }
+}
+
+// ------------------------------------------------------------------
+// INA219 custom calibration -- see config.h.example for how
+// INA219_CALIBRATION / INA219_CURRENT_LSB_A were derived for the 0.01 ohm
+// shunt. The Adafruit_INA219 library only ships fixed presets
+// (setCalibration_32V2A/32V1A/16V400mA) tied to a 0.1 ohm shunt, so
+// getCurrent_mA() would silently use the wrong scale factor for this
+// shunt -- instead we write the calibration register ourselves and read
+// the raw current register directly, scaling by our own Current_LSB.
+// ------------------------------------------------------------------
+static const uint8_t INA219_REG_CALIBRATION = 0x05;
+static const uint8_t INA219_REG_CURRENT     = 0x04;
+
+void ina219WriteCalibration(uint16_t calValue) {
+  Wire.beginTransmission(INA219_I2C_ADDR);
+  Wire.write(INA219_REG_CALIBRATION);
+  Wire.write((uint8_t)(calValue >> 8));
+  Wire.write((uint8_t)(calValue & 0xFF));
+  Wire.endTransmission();
+}
+
+int16_t ina219ReadRawCurrent() {
+  Wire.beginTransmission(INA219_I2C_ADDR);
+  Wire.write(INA219_REG_CURRENT);
+  if (Wire.endTransmission(false) != 0) return 0; // repeated start; bus error -> report 0A rather than garbage
+  if (Wire.requestFrom((uint8_t)INA219_I2C_ADDR, (uint8_t)2) != 2) return 0;
+  uint16_t raw = ((uint16_t)Wire.read() << 8) | Wire.read();
+  return (int16_t)raw;
+}
+
+float readIna219CurrentA() {
+  return ina219ReadRawCurrent() * INA219_CURRENT_LSB_A;
 }
 
 // ------------------------------------------------------------------
@@ -343,7 +324,6 @@ void startCharging() {
   Serial.printf("[charge] START target=%.2fA ocv=%.2fV initialSoC=%.0f%%\n",
                 targetCurrentA, ocv, initialSocFraction * 100.0f);
   updateStatusLedForState();
-  publishChargeState();
 }
 
 void stopCharging(ChargeState endState, const String &reason) {
@@ -353,7 +333,6 @@ void stopCharging(ChargeState endState, const String &reason) {
   faultReason = reason;
   Serial.printf("[charge] STOP -> %s (%s)\n", chargeStateName(endState), reason.c_str());
   updateStatusLedForState();
-  publishChargeState();
 }
 
 // Called every CONTROL_LOOP_INTERVAL_MS. Reads the sensor, runs safety
@@ -366,8 +345,7 @@ void controlLoop() {
   if (dtSec <= 0 || dtSec > 5.0f) dtSec = CONTROL_LOOP_INTERVAL_MS / 1000.0f; // guard first call / overflow
 
   busVoltage = ina219.getBusVoltage_V();
-  float rawCurrentMa = ina219.getCurrent_mA();
-  busCurrent = max(0.0f, rawCurrentMa / 1000.0f); // this design only ever sources current one way
+  busCurrent = max(0.0f, readIna219CurrentA()); // this design only ever sources current one way
 
   if (chargeState != STATE_BULK && chargeState != STATE_ABSORPTION) return;
 
@@ -420,7 +398,6 @@ void controlLoop() {
       belowTerminationSinceMs = 0;
       Serial.println("[charge] BULK -> ABSORPTION");
       updateStatusLedForState();
-      publishChargeState();
     } else {
       float error = targetCurrentA - busCurrent;
       piIntegral = constrain(piIntegral + error * dtSec, -PI_INTEGRAL_CLAMP, PI_INTEGRAL_CLAMP);
@@ -446,6 +423,18 @@ void controlLoop() {
     } else {
       belowTerminationSinceMs = 0;
     }
+  }
+
+  // Throttled tuning log -- watch this in the Serial Monitor while
+  // adjusting BULK_KP/BULK_KI/ABS_KP/ABS_KI against your actual RC
+  // filter/MOSFET: duty should move smoothly toward a steady value, not
+  // oscillate or slam into 0/max repeatedly.
+  static unsigned long lastControlLogMs = 0;
+  if (now - lastControlLogMs >= 1000) {
+    lastControlLogMs = now;
+    Serial.printf("[ctrl] state=%s V=%.2f I=%.2f target=%.2fA duty=%u/%u soc=%.0f%%\n",
+                  chargeStateName(chargeState), busVoltage, busCurrent, targetCurrentA,
+                  gateDuty, GATE_PWM_MAX_DUTY, socFraction * 100.0f);
   }
 }
 
@@ -516,7 +505,6 @@ void handleEncoderAndButton() {
             chargeState = STATE_IDLE;
             faultReason = "";
             updateStatusLedForState();
-            publishChargeState();
           }
         }
       }
@@ -606,279 +594,13 @@ void updateDisplay() {
 }
 
 // ------------------------------------------------------------------
-// MQTT publish helper
-// ------------------------------------------------------------------
-bool checkedPublish(const String &topic, uint8_t qos, bool retain, const String &payload) {
-  uint16_t packetId = mqttClient.publish(topic.c_str(), qos, retain, payload.c_str());
-  if (packetId == 0) {
-    Serial.printf("[mqtt] publish FAILED topic=%s free_heap=%u\n", topic.c_str(), ESP.getFreeHeap());
-  }
-  return packetId != 0;
-}
-
-void publishChargeState() {
-  if (!mqttClient.connected()) return;
-  checkedPublish(stateTopic, 1, true, chargeStateName(chargeState));
-  checkedPublish(voltageTopic, 0, false, String(busVoltage, 2));
-  checkedPublish(currentTopic, 0, false, String(busCurrent, 2));
-  checkedPublish(socTopic, 0, false, String(socFraction * 100.0f, 0));
-  checkedPublish(ahDeliveredTopic, 0, false, String(ahDelivered, 2));
-  checkedPublish(faultTopic, 0, true, faultReason);
-  checkedPublish(targetCurrentStateTopic, 0, true, String(targetCurrentA, 2));
-  checkedPublish(capacityStateTopic, 0, true, useEasyMode ? String(selectedCapacityAh) : String("manual"));
-}
-
-// ------------------------------------------------------------------
-// Home Assistant discovery
-// ------------------------------------------------------------------
-void publishDiscovery() {
-  String deviceJson = String("{") +
-      "\"identifiers\":[\"" + DEVICE_ID + "\"]," +
-      "\"name\":\"" + DEVICE_NAME + "\"," +
-      "\"manufacturer\":\"" + MANUFACTURER + "\"," +
-      "\"model\":\"" + MODEL + "\"," +
-      "\"sw_version\":\"" + FIRMWARE_VERSION + "\"" +
-      "}";
-
-  struct SensorDef { const char* key; const char* name; const String topic; const char* unit; const char* deviceClass; const char* stateClass; };
-  SensorDef sensors[] = {
-    {"state", "Charge State", stateTopic, nullptr, nullptr, nullptr},
-    {"voltage", "Battery Voltage", voltageTopic, "V", "voltage", "measurement"},
-    {"current", "Charge Current", currentTopic, "A", "current", "measurement"},
-    {"soc", "State of Charge", socTopic, "%", "battery", "measurement"},
-    {"ah_delivered", "Ah Delivered", ahDeliveredTopic, "Ah", nullptr, "total_increasing"},
-    {"fault", "Fault Reason", faultTopic, nullptr, nullptr, nullptr},
-    {"wifi_signal", "WiFi Signal", wifiSignalTopic, "dBm", "signal_strength", "measurement"},
-    {"reset_reason", "Reset Reason", resetReasonTopic, nullptr, nullptr, nullptr},
-    {"mqtt_fail_count", "MQTT Fail Count", failCountTopic, nullptr, nullptr, "total_increasing"},
-    {"uptime", "Uptime", uptimeTopic, "s", nullptr, "measurement"},
-  };
-  for (auto &s : sensors) {
-    bool diagnostic = (strcmp(s.key, "wifi_signal") == 0 || strcmp(s.key, "reset_reason") == 0 ||
-                        strcmp(s.key, "mqtt_fail_count") == 0 || strcmp(s.key, "uptime") == 0);
-    String payload = String("{") +
-        "\"name\":\"" + s.name + "\"," +
-        "\"unique_id\":\"" + DEVICE_ID + "_" + s.key + "\"," +
-        "\"state_topic\":\"" + s.topic + "\",";
-    if (s.unit) payload += String("\"unit_of_measurement\":\"") + s.unit + "\",";
-    if (s.deviceClass) payload += String("\"device_class\":\"") + s.deviceClass + "\",";
-    if (s.stateClass) payload += String("\"state_class\":\"") + s.stateClass + "\",";
-    if (diagnostic) payload += "\"entity_category\":\"diagnostic\",";
-    payload += "\"availability_topic\":\"" + availabilityTopic + "\"," +
-        "\"device\":" + deviceJson + "}";
-    checkedPublish(discoverySensorPrefix + s.key + "/config", 1, true, payload);
-  }
-
-  // Target current (number entity)
-  {
-    String payload = String("{") +
-        "\"name\":\"Target Current\"," +
-        "\"unique_id\":\"" + DEVICE_ID + "_target_current\"," +
-        "\"state_topic\":\"" + targetCurrentStateTopic + "\"," +
-        "\"command_topic\":\"" + targetCurrentCmdTopic + "\"," +
-        "\"unit_of_measurement\":\"A\"," +
-        "\"min\":" + String(MANUAL_CURRENT_MIN_A, 1) + "," +
-        "\"max\":" + String(MAX_CHARGE_CURRENT_A, 1) + "," +
-        "\"step\":" + String(MANUAL_CURRENT_STEP_A, 1) + "," +
-        "\"mode\":\"box\"," +
-        "\"availability_topic\":\"" + availabilityTopic + "\"," +
-        "\"device\":" + deviceJson +
-        "}";
-    checkedPublish(discoveryNumberPrefix + "target_current/config", 1, true, payload);
-  }
-
-  // Capacity preset (select entity)
-  {
-    String options = "[\"manual\"";
-    for (uint8_t i = 0; i < CAPACITY_PRESETS_COUNT; i++) {
-      options += ",\"" + String(CAPACITY_PRESETS_AH[i]) + "\"";
-    }
-    options += "]";
-    String payload = String("{") +
-        "\"name\":\"Battery Capacity\"," +
-        "\"unique_id\":\"" + DEVICE_ID + "_capacity\"," +
-        "\"state_topic\":\"" + capacityStateTopic + "\"," +
-        "\"command_topic\":\"" + capacityCmdTopic + "\"," +
-        "\"options\":" + options + "," +
-        "\"availability_topic\":\"" + availabilityTopic + "\"," +
-        "\"device\":" + deviceJson +
-        "}";
-    checkedPublish(discoverySelectPrefix + "capacity/config", 1, true, payload);
-  }
-
-  // Start / Stop buttons
-  {
-    String startPayload = String("{") +
-        "\"name\":\"Start Charging\"," +
-        "\"unique_id\":\"" + DEVICE_ID + "_start\"," +
-        "\"command_topic\":\"" + startCmdTopic + "\"," +
-        "\"payload_press\":\"START\"," +
-        "\"availability_topic\":\"" + availabilityTopic + "\"," +
-        "\"device\":" + deviceJson +
-        "}";
-    checkedPublish(discoveryButtonPrefix + "start/config", 1, true, startPayload);
-
-    String stopPayload = String("{") +
-        "\"name\":\"Stop Charging\"," +
-        "\"unique_id\":\"" + DEVICE_ID + "_stop\"," +
-        "\"command_topic\":\"" + stopCmdTopic + "\"," +
-        "\"payload_press\":\"STOP\"," +
-        "\"availability_topic\":\"" + availabilityTopic + "\"," +
-        "\"device\":" + deviceJson +
-        "}";
-    checkedPublish(discoveryButtonPrefix + "stop/config", 1, true, stopPayload);
-  }
-}
-
-// ------------------------------------------------------------------
-// MQTT callbacks
-// ------------------------------------------------------------------
-void onMqttConnect(bool sessionPresent) {
-  Serial.println("[mqtt] connected");
-  mqttBackoffMs = 1000;
-  everConnected = true;
-
-  checkedPublish(availabilityTopic, 1, true, "online");
-
-  mqttClient.subscribe(targetCurrentCmdTopic.c_str(), 1);
-  mqttClient.subscribe(capacityCmdTopic.c_str(), 1);
-  mqttClient.subscribe(startCmdTopic.c_str(), 1);
-  mqttClient.subscribe(stopCmdTopic.c_str(), 1);
-
-  publishDiscovery();
-  publishChargeState();
-  publishDiagnostics(true);
-}
-
-void onMqttDisconnect(espMqttClientTypes::DisconnectReason reason) {
-  Serial.printf("[mqtt] disconnected, reason: %u\n", static_cast<uint8_t>(reason));
-  if (everConnected) mqttFailCount++;
-  mqttBackoffMs = min(mqttBackoffMs * 2, MQTT_BACKOFF_MAX_MS);
-}
-
-void onMqttMessage(const espMqttClientTypes::MessageProperties& properties,
-                    const char* topic, const uint8_t* payload, size_t len,
-                    size_t index, size_t total) {
-  String topicStr(topic);
-  String payloadStr;
-  payloadStr.reserve(len);
-  for (size_t i = 0; i < len; i++) payloadStr += (char)payload[i];
-
-  Serial.printf("[mqtt] message topic=%s payload=%s\n", topicStr.c_str(), payloadStr.c_str());
-
-  if (topicStr == targetCurrentCmdTopic) {
-    if (chargeState != STATE_IDLE) {
-      Serial.println("[mqtt] ignoring target_current change while charging (stop first)");
-      return;
-    }
-    float v = payloadStr.toFloat();
-    useEasyMode = false;
-    selectedCapacityAh = 0;
-    targetCurrentA = constrain(v, MANUAL_CURRENT_MIN_A, MAX_CHARGE_CURRENT_A);
-    savePersistedSettings();
-    publishChargeState();
-  } else if (topicStr == capacityCmdTopic) {
-    if (chargeState != STATE_IDLE) {
-      Serial.println("[mqtt] ignoring capacity change while charging (stop first)");
-      return;
-    }
-    if (payloadStr == "manual") {
-      useEasyMode = false;
-      selectedCapacityAh = 0;
-    } else {
-      uint16_t ah = (uint16_t)payloadStr.toInt();
-      for (uint8_t i = 0; i < CAPACITY_PRESETS_COUNT; i++) {
-        if (CAPACITY_PRESETS_AH[i] == ah) {
-          capacityPresetIndex = i;
-          useEasyMode = true;
-          selectedCapacityAh = ah;
-          targetCurrentA = constrain(ah * BULK_CURRENT_FRACTION_OF_CAPACITY, MANUAL_CURRENT_MIN_A, MAX_CHARGE_CURRENT_A);
-          break;
-        }
-      }
-    }
-    savePersistedSettings();
-    publishChargeState();
-  } else if (topicStr == startCmdTopic) {
-    if (chargeState == STATE_IDLE) startCharging();
-  } else if (topicStr == stopCmdTopic) {
-    if (chargeState == STATE_BULK || chargeState == STATE_ABSORPTION) {
-      stopCharging(STATE_IDLE, "Stopped via MQTT");
-    }
-  }
-}
-
-// ------------------------------------------------------------------
-// WiFi -- DHCP only (see plugin_light/smart_switch for why: avoids the
-// WiFi.config() race with stale NVS credentials on a reused board)
-// ------------------------------------------------------------------
-void connectWifi() {
-  if (WiFi.status() == WL_CONNECTED || wifiConnectInProgress) return;
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.setHostname(DEVICE_ID);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  wifiConnectInProgress = true;
-  wifiConnectStartMs = millis();
-  Serial.println("[wifi] connecting...");
-}
-
-void maintainWifi() {
-  if (WiFi.status() == WL_CONNECTED) {
-    if (wifiConnectInProgress) {
-      wifiConnectInProgress = false;
-      Serial.printf("[wifi] connected, ip=%s\n", WiFi.localIP().toString().c_str());
-    }
-    return;
-  }
-  if (!wifiConnectInProgress) {
-    connectWifi();
-  } else if (millis() - wifiConnectStartMs > WIFI_CONNECT_TIMEOUT_MS) {
-    Serial.println("[wifi] connect attempt timed out, will retry");
-    wifiConnectInProgress = false;
-  }
-}
-
-void connectMqtt() {
-  lastMqttAttemptMs = millis();
-  if (WiFi.status() != WL_CONNECTED) return;
-  Serial.println("[mqtt] connecting...");
-  mqttClient.connect();
-}
-
-void publishDiagnostics(bool force) {
-  if (!mqttClient.connected()) return;
-  if (WiFi.status() == WL_CONNECTED) {
-    checkedPublish(wifiSignalTopic, 1, true, String(WiFi.RSSI()));
-  }
-  static bool resetReasonSent = false;
-  if (force || !resetReasonSent) {
-    checkedPublish(resetReasonTopic, 1, true, resetReasonString());
-    resetReasonSent = true;
-  }
-  checkedPublish(failCountTopic, 1, true, String(mqttFailCount));
-  checkedPublish(uptimeTopic, 1, true, String(millis() / 1000));
-}
-
-void setupOta() {
-  ArduinoOTA.setHostname(DEVICE_ID);
-  ArduinoOTA.setPassword(OTA_PASSWORD);
-  ArduinoOTA.onStart([]() {
-    Serial.println("[OTA] start");
-    applyGateDuty(0); // never leave the charger driving current through an OTA flash
-  });
-  ArduinoOTA.onEnd([]() { Serial.println("[OTA] done"); });
-  ArduinoOTA.onError([](ota_error_t error) { Serial.printf("[OTA] error %u\n", (unsigned)error); });
-  ArduinoOTA.begin();
-}
-
-// ------------------------------------------------------------------
 // Setup / loop
 // ------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("\n[Car Battery Charger] booting, reset reason: " + resetReasonString());
+  Serial.printf("[fw] version %s\n", FIRMWARE_VERSION);
 
   // Gate pin: pulled low immediately, before ledcAttach, so there's no
   // window where it floats high and turns the MOSFET on.
@@ -906,49 +628,20 @@ void setup() {
   if (!ina219.begin()) {
     Serial.println("[ina219] FAILED to initialize -- check wiring/address");
   }
+  ina219WriteCalibration(INA219_CALIBRATION);
+  Serial.printf("[ina219] custom calibration=%u current_lsb=%.6fA/bit (0.01ohm shunt)\n",
+                INA219_CALIBRATION, INA219_CURRENT_LSB_A);
   u8g2.begin();
 
   loadPersistedSettings();
   chargeState = STATE_IDLE; // never auto-resume charging after a reboot
   updateStatusLedForState();
 
-  connectWifi();
-  {
-    unsigned long waitStart = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - waitStart < 5000) delay(100);
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    wifiConnectInProgress = false;
-    Serial.printf("[wifi] connected, ip=%s\n", WiFi.localIP().toString().c_str());
-  } else {
-    Serial.println("[wifi] not yet connected at boot, will keep retrying in loop()");
-  }
-
-  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
-  mqttClient.setCredentials(MQTT_USER, MQTT_PASSWORD);
-  mqttClient.setClientId(DEVICE_ID);
-  mqttClient.setWill(availabilityTopic.c_str(), 1, true, "offline");
-  mqttClient.onConnect(onMqttConnect);
-  mqttClient.onDisconnect(onMqttDisconnect);
-  mqttClient.onMessage(onMqttMessage);
-  connectMqtt();
-
-  setupOta();
-
   lastControlLoopMs = millis();
   Serial.println("[boot] ready");
 }
 
 void loop() {
-  maintainWifi();
-
-  if (!mqttClient.connected()) {
-    unsigned long now = millis();
-    if (now - lastMqttAttemptMs >= mqttBackoffMs) connectMqtt();
-  }
-  mqttClient.loop();
-  ArduinoOTA.handle();
-
   handleEncoderAndButton();
 
   unsigned long now = millis();
@@ -958,10 +651,5 @@ void loop() {
   if (now - lastDisplayMs >= DISPLAY_UPDATE_INTERVAL_MS) {
     lastDisplayMs = now;
     updateDisplay();
-    if (mqttClient.connected()) publishChargeState();
-  }
-  if (now - lastDiagPublishMs >= DIAG_INTERVAL_MS) {
-    lastDiagPublishMs = now;
-    publishDiagnostics(false);
   }
 }
