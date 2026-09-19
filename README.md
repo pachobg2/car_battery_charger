@@ -273,12 +273,18 @@ thing) if clockwise decreases instead of increases.
 - **Idle, manual mode**: rotate to adjust target charge current
   (`MANUAL_CURRENT_STEP_A` per detent), click to start charging at that
   current.
-- **Idle, long-press**: enters easy mode — rotate to scroll through the
-  capacity presets in `CAPACITY_PRESETS_AH` (44/50/55/60/65/70/80/85/
-  90/100 Ah), click to confirm (sets target current to
-  `BULK_CURRENT_FRACTION_OF_CAPACITY` × capacity, i.e. C/10 by default —
-  10A for the 100Ah preset, see the thermal warning above), long-press
-  again to cancel back out without changing anything.
+- **Idle, long-press**: opens the capacity/mode picker — rotate to
+  scroll through the capacity presets in `CAPACITY_PRESETS_AH`
+  (44/50/55/60/65/70/80/85/90/100 Ah) plus one extra "Manual" entry past
+  the last preset. Click confirms whatever's showing: a capacity sets
+  target current to `BULK_CURRENT_FRACTION_OF_CAPACITY` × capacity
+  (C/10 by default — 10A for the 100Ah preset, see the thermal warning
+  above); "Manual" switches back to manual current entry — **this is
+  the only way back out of easy mode once a capacity's been confirmed**,
+  scroll one past the last preset to reach it. Long-press again cancels
+  back out without changing anything. The picker opens on "Manual" if
+  you're currently in manual mode, or on the current preset if you're
+  already in easy mode.
 - **While charging**: click stops immediately and returns to idle.
   Rotation and long-press are ignored while active — stop first to
   change settings.
@@ -352,3 +358,4 @@ unattended.
 | v1.3.1 | 2026-09-19 | Fixed a compile error: `Adafruit_INA219.h` already `#define`s `INA219_REG_CALIBRATION`/`INA219_REG_CURRENT` itself, and this sketch's own `static const` declarations of the same names collided with those macros at preprocessing. Removed the redundant declarations; the register writes now just use the library's own macros directly. |
 | v1.4.0 | 2026-09-19 | Fixed encoder bouncing/jumping: replaced the naive "compare A and B on every A edge" decoder with a full quadrature state-table decoder driven by interrupts on both A and B, which structurally rejects mechanical contact bounce instead of counting every raw edge. Added `ENCODER_REVERSED` to flip rotation direction (clockwise was decreasing current; defaults to `true` now so clockwise increases it). |
 | v1.5.0 | 2026-09-19 | Fixed the status LED: wrong color order (`NEO_GRB` instead of the `NEO_RGB` Waveshare's own docs specify for the ESP32-C3-Zero's onboard WS2812) and added a boot-time Serial message so a missing `Adafruit_NeoPixel` library -- which silently compiles the whole LED code path out via `__has_include()`, with no other symptom -- is diagnosable instead of just "the LED does nothing." Redesigned the OLED layout: battery icon with SoC%, bold header with a capacity/manual badge, bigger voltage/current readout, and a `drawStrFit()` helper that measures and truncates any status text instead of letting it silently run off the display edge (fixes `"(click=start)"` and several fault-reason strings getting cut off). |
+| v1.6.0 | 2026-09-19 | `ENCODER_REVERSED` default flipped to `false` (confirmed correct on the actual build). Fixed the capacity-select screen's header text overflowing the display uncaught (`u8g2.drawStr()` instead of `drawStrFit()`) and shortened the confirm/cancel hint so it fits without truncating mid-word. Added a "Manual" entry past the last capacity preset in the picker -- previously, once a capacity was confirmed there was no way back to manual current entry at all; scroll one past the last preset and click to get back. |

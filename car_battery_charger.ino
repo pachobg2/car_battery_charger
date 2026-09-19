@@ -593,8 +593,11 @@ void handleEncoderAndButton() {
     int32_t detents = ENCODER_REVERSED ? -rawDetents : rawDetents;
 
     if (uiMode == UI_SELECT_CAPACITY) {
+      // Cursor range is 0..CAPACITY_PRESETS_COUNT inclusive -- the extra
+      // slot past the last preset is "Manual", the only way back out of
+      // easy mode once a capacity has been confirmed.
       int newCursor = (int)capacitySelectCursor + detents;
-      capacitySelectCursor = (uint8_t)constrain(newCursor, 0, CAPACITY_PRESETS_COUNT - 1);
+      capacitySelectCursor = (uint8_t)constrain(newCursor, 0, (int)CAPACITY_PRESETS_COUNT);
     } else if (uiMode == UI_MAIN && chargeState == STATE_IDLE && !useEasyMode) {
       float newTarget = targetCurrentA + detents * MANUAL_CURRENT_STEP_A;
       targetCurrentA = constrain(newTarget, MANUAL_CURRENT_MIN_A, MAX_CHARGE_CURRENT_A);
@@ -618,14 +621,23 @@ void handleEncoderAndButton() {
       if (!buttonLongPressFired) {
         // ---- short click ----
         if (uiMode == UI_SELECT_CAPACITY) {
-          capacityPresetIndex = capacitySelectCursor;
-          selectedCapacityAh = CAPACITY_PRESETS_AH[capacityPresetIndex];
-          useEasyMode = true;
-          targetCurrentA = constrain(selectedCapacityAh * BULK_CURRENT_FRACTION_OF_CAPACITY,
-                                      MANUAL_CURRENT_MIN_A, MAX_CHARGE_CURRENT_A);
-          savePersistedSettings();
-          uiMode = UI_MAIN;
-          Serial.printf("[ui] capacity confirmed: %uAh -> target %.2fA\n", selectedCapacityAh, targetCurrentA);
+          if (capacitySelectCursor == CAPACITY_PRESETS_COUNT) {
+            // "Manual" -- the way back out of easy mode
+            useEasyMode = false;
+            selectedCapacityAh = 0;
+            savePersistedSettings();
+            uiMode = UI_MAIN;
+            Serial.println("[ui] switched to manual mode");
+          } else {
+            capacityPresetIndex = capacitySelectCursor;
+            selectedCapacityAh = CAPACITY_PRESETS_AH[capacityPresetIndex];
+            useEasyMode = true;
+            targetCurrentA = constrain(selectedCapacityAh * BULK_CURRENT_FRACTION_OF_CAPACITY,
+                                        MANUAL_CURRENT_MIN_A, MAX_CHARGE_CURRENT_A);
+            savePersistedSettings();
+            uiMode = UI_MAIN;
+            Serial.printf("[ui] capacity confirmed: %uAh -> target %.2fA\n", selectedCapacityAh, targetCurrentA);
+          }
         } else { // UI_MAIN
           if (chargeState == STATE_IDLE) {
             startCharging();
@@ -647,8 +659,8 @@ void handleEncoderAndButton() {
     if (chargeState == STATE_IDLE) {
       if (uiMode == UI_MAIN) {
         uiMode = UI_SELECT_CAPACITY;
-        capacitySelectCursor = capacityPresetIndex;
-        Serial.println("[ui] entering easy-mode capacity select");
+        capacitySelectCursor = useEasyMode ? capacityPresetIndex : CAPACITY_PRESETS_COUNT;
+        Serial.println("[ui] entering capacity/mode select");
       } else {
         uiMode = UI_MAIN; // long-press again cancels back out without changes
         Serial.println("[ui] leaving capacity select (cancelled)");
@@ -707,13 +719,17 @@ void updateDisplay() {
 
   if (uiMode == UI_SELECT_CAPACITY) {
     u8g2.setFont(u8g2_font_6x10_tf);
-    u8g2.drawStr(0, 10, "Select battery capacity:");
+    drawStrFit(0, 10, 128, "Select capacity");
     u8g2.setFont(u8g2_font_logisoso16_tf);
     char buf[16];
-    snprintf(buf, sizeof(buf), "%u Ah", CAPACITY_PRESETS_AH[capacitySelectCursor]);
+    if (capacitySelectCursor == CAPACITY_PRESETS_COUNT) {
+      snprintf(buf, sizeof(buf), "Manual");
+    } else {
+      snprintf(buf, sizeof(buf), "%u Ah", CAPACITY_PRESETS_AH[capacitySelectCursor]);
+    }
     u8g2.drawStr(10, 40, buf);
     u8g2.setFont(u8g2_font_6x10_tf);
-    drawStrFit(0, 60, 128, "Click = confirm, hold = cancel");
+    drawStrFit(0, 60, 128, "Click=OK  Hold=cancel");
     u8g2.sendBuffer();
     return;
   }
