@@ -48,8 +48,8 @@ There's no OTA in this build — flash over USB every time.
 |---|---|---|
 | I2C SDA | GPIO4 | shared bus: INA219 + OLED |
 | I2C SCL | GPIO5 | |
-| Encoder A | GPIO6 | interrupt-driven quadrature |
-| Encoder B | GPIO7 | |
+| Encoder A | GPIO6 | interrupt-driven quadrature, bounce-rejecting |
+| Encoder B | GPIO7 | also interrupt-driven -- see below |
 | Encoder button | GPIO3 | active low, internal pull-up |
 | MOSFET gate bias (via RC filter, feeds all 4 gates) | GPIO1 | LEDC PWM, 20kHz carrier |
 | Supply-rail voltage divider | GPIO0 | ADC1_CH0, see Voltage sensing below |
@@ -250,6 +250,21 @@ predictable.
 
 ## Local UI (rotary encoder)
 
+**Decoding**: both A and B are interrupt-driven (not just A), and every
+edge is run through a full quadrature state table (`onEncoderChange()`)
+that only accepts legal single-step transitions along the Gray-code
+sequence and silently drops everything else — including mechanical
+contact bounce, which is what a naive "compare A and B on every A edge"
+decoder has no way to distinguish from a real click. If it still feels
+jumpy after this, it's likely a genuinely noisy encoder and worth adding
+a small hardware debounce (100nF from A to GND and from B to GND).
+
+**Direction**: `ENCODER_REVERSED` in `config.h` flips which physical
+rotation direction increases a value — there's no universal "clockwise
+means more" convention, it depends on which of A/B you wired where.
+Flip it (or swap the A/B wires at the encoder, which does the same
+thing) if clockwise decreases instead of increases.
+
 - **Idle, manual mode**: rotate to adjust target charge current
   (`MANUAL_CURRENT_STEP_A` per detent), click to start charging at that
   current.
@@ -309,3 +324,4 @@ unattended.
 | v1.2.0 | 2026-09-18 | Fixed a battery-voltage measurement bug: the INA219's bus-voltage reading is the floating MOSFET-side return rail, not battery voltage, given the low-side MOSFET placement -- added a second resistor divider into an ESP32 ADC pin (GPIO0) to measure the actual supply rail, and compute battery voltage as supply_measured minus the INA219 bus reading. Also moved the MOSFET stage to a bank of 4 parallel IRL540Ns with per-device source ballast resistors for current sharing, spreading the ~145W worst-case dissipation at the 10A ceiling across multiple packages. |
 | v1.3.0 | 2026-09-18 | Added a piezo buzzer (GPIO8) with a non-blocking tone sequencer (`updateBuzzer()`): distinct patterns for charge start, charge complete, fault/refused start, and manual stop. |
 | v1.3.1 | 2026-09-19 | Fixed a compile error: `Adafruit_INA219.h` already `#define`s `INA219_REG_CALIBRATION`/`INA219_REG_CURRENT` itself, and this sketch's own `static const` declarations of the same names collided with those macros at preprocessing. Removed the redundant declarations; the register writes now just use the library's own macros directly. |
+| v1.4.0 | 2026-09-19 | Fixed encoder bouncing/jumping: replaced the naive "compare A and B on every A edge" decoder with a full quadrature state-table decoder driven by interrupts on both A and B, which structurally rejects mechanical contact bounce instead of counting every raw edge. Added `ENCODER_REVERSED` to flip rotation direction (clockwise was decreasing current; defaults to `true` now so clockwise increases it). |

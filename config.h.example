@@ -9,7 +9,7 @@
 // Device identity
 // ------------------------------------------------------------------
 static const char* DEVICE_ID        = "car_battery_charger1"; // NVS (Preferences) namespace
-static const char* FIRMWARE_VERSION = "1.3.1";
+static const char* FIRMWARE_VERSION = "1.4.0";
 
 // ------------------------------------------------------------------
 // Hardware -- I2C bus (INA219 current/voltage sensor + SH1106 OLED)
@@ -93,8 +93,18 @@ static const int ENCODER_B_PIN  = 7;
 static const int ENCODER_SW_PIN = 3;
 // Most cheap mechanical encoders produce 4 A/B edges per detent (click).
 // If a single click of your encoder moves the value by 4 steps instead of
-// 1, or does nothing, try 1 or 2 here.
+// 1, or does nothing, try 1 or 2 here. (The decoder itself is bounce-
+// rejecting -- see onEncoderChange() in the sketch -- so this is purely
+// about how many electrical edges your specific encoder produces per
+// mechanical click, not a debounce tuning knob.)
 static const uint8_t ENCODER_EDGES_PER_DETENT = 4;
+// Which physical rotation direction increases a value (manual current,
+// capacity scroll) is determined by which of A/B you wired where --
+// there's no universal answer, so it's a flag instead of a fixed
+// assumption. Flip this if turning clockwise decreases instead of
+// increases (or swap the A/B wires at the encoder instead, which has
+// the same effect).
+static const bool ENCODER_REVERSED = true;
 
 // ------------------------------------------------------------------
 // Hardware -- onboard WS2812 status LED (matches smart_switch's GPIO10

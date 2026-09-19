@@ -139,8 +139,10 @@ float piIntegral = 0.0f; // shared integral accumulator, reset on every stage/ch
 unsigned long lastControlLoopMs = 0;
 unsigned long lastDisplayMs = 0;
 
-// Encoder state (quadrature decode via ISR on the A pin)
+// Encoder state (quadrature decode via ISR on both A and B pins, using a
+// full-state transition table -- see onEncoderChange() for why)
 volatile int32_t encoderRawCount = 0;
+volatile uint8_t encoderPrevState = 0;
 int32_t encoderLastConsumedCount = 0;
 
 // Button state
@@ -541,11 +543,32 @@ void controlLoop() {
 
 // ------------------------------------------------------------------
 // Encoder (interrupt-driven quadrature decode) + button (polled)
+//
+// A naive "just compare A and B on every A edge" decoder (the previous
+// version of this function) has no way to tell a real detent click
+// apart from mechanical contact bounce -- every bounce toggles the pin
+// and gets counted as a real step, which is exactly the "bouncing and
+// jumping" symptom. This version reads BOTH A and B on every edge of
+// EITHER pin, and looks up the (previous state, new state) pair in a
+// full quadrature state table: legitimate single-step transitions along
+// the Gray-code sequence (00-01-11-10-00, or its reverse) return +-1,
+// and anything else -- no change, or an impossible two-bit jump, which
+// is what most bounce looks like -- returns 0 and is ignored. No timer-
+// based debounce needed; the table does it structurally.
 // ------------------------------------------------------------------
-void IRAM_ATTR onEncoderAChange() {
-  bool a = digitalRead(ENCODER_A_PIN);
-  bool b = digitalRead(ENCODER_B_PIN);
-  encoderRawCount += (a == b) ? 1 : -1;
+void IRAM_ATTR onEncoderChange() {
+  static const int8_t QUAD_TABLE[16] = {
+     0, -1,  1,  0,
+     1,  0,  0, -1,
+    -1,  0,  0,  1,
+     0,  1, -1,  0
+  };
+  uint8_t a = digitalRead(ENCODER_A_PIN);
+  uint8_t b = digitalRead(ENCODER_B_PIN);
+  uint8_t currState = (a << 1) | b;
+  uint8_t index = (encoderPrevState << 2) | currState;
+  encoderRawCount += QUAD_TABLE[index];
+  encoderPrevState = currState;
 }
 
 // Consumes accumulated encoder ticks and any button edges, and updates
@@ -559,9 +582,10 @@ void handleEncoderAndButton() {
   int32_t raw = encoderRawCount;
   interrupts();
   int32_t rawDelta = raw - encoderLastConsumedCount;
-  int32_t detents = rawDelta / ENCODER_EDGES_PER_DETENT;
-  if (detents != 0) {
-    encoderLastConsumedCount += detents * ENCODER_EDGES_PER_DETENT;
+  int32_t rawDetents = rawDelta / ENCODER_EDGES_PER_DETENT;
+  if (rawDetents != 0) {
+    encoderLastConsumedCount += rawDetents * ENCODER_EDGES_PER_DETENT;
+    int32_t detents = ENCODER_REVERSED ? -rawDetents : rawDetents;
 
     if (uiMode == UI_SELECT_CAPACITY) {
       int newCursor = (int)capacitySelectCursor + detents;
@@ -716,7 +740,9 @@ void setup() {
   pinMode(ENCODER_A_PIN, INPUT_PULLUP);
   pinMode(ENCODER_B_PIN, INPUT_PULLUP);
   pinMode(ENCODER_SW_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_A_PIN), onEncoderAChange, CHANGE);
+  encoderPrevState = (digitalRead(ENCODER_A_PIN) << 1) | digitalRead(ENCODER_B_PIN);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_A_PIN), onEncoderChange, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_B_PIN), onEncoderChange, CHANGE);
 
 #if __has_include(<Adafruit_NeoPixel.h>)
   if (STATUS_LED_ENABLED) {
