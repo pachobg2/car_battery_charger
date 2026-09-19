@@ -9,7 +9,7 @@
 // Device identity
 // ------------------------------------------------------------------
 static const char* DEVICE_ID        = "car_battery_charger1"; // NVS (Preferences) namespace
-static const char* FIRMWARE_VERSION = "1.6.1";
+static const char* FIRMWARE_VERSION = "1.7.0";
 
 // ------------------------------------------------------------------
 // Hardware -- I2C bus (INA219 current/voltage sensor + SH1106 OLED)
@@ -286,6 +286,14 @@ static const float DEFAULT_MANUAL_CURRENT_A = 1.0f;
 // ------------------------------------------------------------------
 static const uint32_t LONG_PRESS_MS       = 1500;
 static const uint32_t BUTTON_DEBOUNCE_MS  = 30;
+// How long the full-screen value readout (drawBigOverlay()) stays up
+// after the triggering action, before the normal status screen resumes.
+// Rotating the encoder resets this timer on every detent, so it's really
+// "3s after the LAST tick", not 3s total. The mode-switch one is
+// shorter -- it's just a confirmation, not something you're actively
+// adjusting.
+static const uint32_t BIG_OVERLAY_SCROLL_MS      = 3000;
+static const uint32_t BIG_OVERLAY_MODE_SWITCH_MS = 2000;
 
 // ------------------------------------------------------------------
 // Control loop

@@ -46,10 +46,15 @@
  * plausible. Charging never auto-resumes after a reboot/power loss --
  * always requires a fresh explicit start.
  *
- * Local UI: rotate the encoder to set manual charge current, click to
- * start/stop, long-press to enter "easy mode" (pick a capacity preset
- * from config.h's CAPACITY_PRESETS_AH, which auto-computes the bulk
- * current from BULK_CURRENT_FRACTION_OF_CAPACITY).
+ * Local UI: rotating the encoder while idle adjusts the live value --
+ * manual target current, or the capacity preset (from config.h's
+ * CAPACITY_PRESETS_AH, auto-computing bulk current via
+ * BULK_CURRENT_FRACTION_OF_CAPACITY) if in easy mode -- and pops up a
+ * full-screen readout for a few seconds (see drawBigOverlay()). No
+ * separate confirm step; it applies as you turn it. Long-press instantly
+ * toggles between manual and easy mode, showing the same readout
+ * briefly. Click still just starts/stops/acknowledges, unchanged by any
+ * of this.
  *
  * A piezo buzzer (BUZZER_PIN, driven via tone()/noTone()) plays a short
  * non-blocking tone pattern on every charge state transition: a rising
@@ -97,8 +102,6 @@ const char* chargeStateName(ChargeState s) {
   }
 }
 
-enum UiMode { UI_MAIN, UI_SELECT_CAPACITY };
-
 // ------------------------------------------------------------------
 // Globals
 // ------------------------------------------------------------------
@@ -113,14 +116,23 @@ Adafruit_NeoPixel statusLed(1, STATUS_LED_PIN, NEO_RGB + NEO_KHZ800);
 #endif
 
 ChargeState chargeState = STATE_IDLE;
-UiMode uiMode = UI_MAIN;
 String faultReason = "";
 
 bool useEasyMode = false;
 uint8_t capacityPresetIndex = DEFAULT_CAPACITY_PRESET_INDEX;
 uint16_t selectedCapacityAh = 0; // 0 while in manual mode
 float targetCurrentA = DEFAULT_MANUAL_CURRENT_A;
-uint8_t capacitySelectCursor = DEFAULT_CAPACITY_PRESET_INDEX; // scroll position while choosing
+
+// Big-digit overlay: rotating the encoder (to scroll a capacity preset
+// or adjust manual current) or long-pressing (to switch mode) shows a
+// full-screen readout instead of the normal status screen, until
+// bigOverlayUntilMs passes -- see updateDisplay()/drawBigOverlay(). The
+// underlying value is applied live as you turn it; there's no separate
+// confirm step. overlaySettingsDirty defers the NVS write until the
+// overlay actually dismisses, so spinning the encoder fast doesn't
+// hammer flash with a write per detent.
+unsigned long bigOverlayUntilMs = 0; // 0 or in the past = not showing
+bool overlaySettingsDirty = false;
 
 float busVoltage = 0.0f;
 float busCurrent = 0.0f; // amps, always >= 0 for this design (one-directional charging)
@@ -173,6 +185,7 @@ void controlLoop();
 void updateDisplay();
 void drawStrFit(int x, int y, int maxWidth, const char* text);
 void drawBatteryIcon(int x, int y, int w, int h, float fraction);
+void drawBigOverlay();
 void handleEncoderAndButton();
 void applyGateDuty(uint16_t duty);
 float estimateSocFromOcv(float v);
@@ -579,8 +592,26 @@ void IRAM_ATTR onEncoderChange() {
 // Consumes accumulated encoder ticks and any button edges, and updates
 // charge/UI state. Called every loop() iteration -- cheap when nothing
 // changed.
+//
+// Interaction model: no separate "picker" screen or confirm step.
+// Rotating while idle adjusts the live value directly -- the capacity
+// preset if in easy mode, the manual target current otherwise -- and
+// pops up a full-screen readout (drawBigOverlay()) that auto-dismisses
+// BIG_OVERLAY_SCROLL_MS after the last tick. Long-pressing instantly
+// toggles between easy and manual mode and shows the same overlay for
+// the shorter BIG_OVERLAY_MODE_SWITCH_MS. The click button's role is
+// unchanged by any of this -- start/stop/acknowledge -- and works the
+// same whether or not the overlay happens to be showing.
 void handleEncoderAndButton() {
   unsigned long now = millis();
+
+  // A deferred settings save from the last rotation lands once the
+  // overlay it triggered actually dismisses, rather than on every
+  // single detent while the user is still spinning the encoder.
+  if (overlaySettingsDirty && now >= bigOverlayUntilMs) {
+    savePersistedSettings();
+    overlaySettingsDirty = false;
+  }
 
   // ---- Encoder rotation ----
   noInterrupts();
@@ -592,15 +623,19 @@ void handleEncoderAndButton() {
     encoderLastConsumedCount += rawDetents * ENCODER_EDGES_PER_DETENT;
     int32_t detents = ENCODER_REVERSED ? -rawDetents : rawDetents;
 
-    if (uiMode == UI_SELECT_CAPACITY) {
-      // Cursor range is 0..CAPACITY_PRESETS_COUNT inclusive -- the extra
-      // slot past the last preset is "Manual", the only way back out of
-      // easy mode once a capacity has been confirmed.
-      int newCursor = (int)capacitySelectCursor + detents;
-      capacitySelectCursor = (uint8_t)constrain(newCursor, 0, (int)CAPACITY_PRESETS_COUNT);
-    } else if (uiMode == UI_MAIN && chargeState == STATE_IDLE && !useEasyMode) {
-      float newTarget = targetCurrentA + detents * MANUAL_CURRENT_STEP_A;
-      targetCurrentA = constrain(newTarget, MANUAL_CURRENT_MIN_A, MAX_CHARGE_CURRENT_A);
+    if (chargeState == STATE_IDLE) {
+      if (useEasyMode) {
+        int newIdx = (int)capacityPresetIndex + detents;
+        capacityPresetIndex = (uint8_t)constrain(newIdx, 0, (int)CAPACITY_PRESETS_COUNT - 1);
+        selectedCapacityAh = CAPACITY_PRESETS_AH[capacityPresetIndex];
+        targetCurrentA = constrain(selectedCapacityAh * BULK_CURRENT_FRACTION_OF_CAPACITY,
+                                    MANUAL_CURRENT_MIN_A, MAX_CHARGE_CURRENT_A);
+      } else {
+        float newTarget = targetCurrentA + detents * MANUAL_CURRENT_STEP_A;
+        targetCurrentA = constrain(newTarget, MANUAL_CURRENT_MIN_A, MAX_CHARGE_CURRENT_A);
+      }
+      overlaySettingsDirty = true;
+      bigOverlayUntilMs = now + BIG_OVERLAY_SCROLL_MS;
     }
   }
 
@@ -620,34 +655,14 @@ void handleEncoderAndButton() {
       // release -- if a long press already fired, this release does nothing more
       if (!buttonLongPressFired) {
         // ---- short click ----
-        if (uiMode == UI_SELECT_CAPACITY) {
-          if (capacitySelectCursor == CAPACITY_PRESETS_COUNT) {
-            // "Manual" -- the way back out of easy mode
-            useEasyMode = false;
-            selectedCapacityAh = 0;
-            savePersistedSettings();
-            uiMode = UI_MAIN;
-            Serial.println("[ui] switched to manual mode");
-          } else {
-            capacityPresetIndex = capacitySelectCursor;
-            selectedCapacityAh = CAPACITY_PRESETS_AH[capacityPresetIndex];
-            useEasyMode = true;
-            targetCurrentA = constrain(selectedCapacityAh * BULK_CURRENT_FRACTION_OF_CAPACITY,
-                                        MANUAL_CURRENT_MIN_A, MAX_CHARGE_CURRENT_A);
-            savePersistedSettings();
-            uiMode = UI_MAIN;
-            Serial.printf("[ui] capacity confirmed: %uAh -> target %.2fA\n", selectedCapacityAh, targetCurrentA);
-          }
-        } else { // UI_MAIN
-          if (chargeState == STATE_IDLE) {
-            startCharging();
-          } else if (chargeState == STATE_BULK || chargeState == STATE_ABSORPTION) {
-            stopCharging(STATE_IDLE, "Stopped by user");
-          } else { // DONE or FAULT -- acknowledge and return to idle
-            chargeState = STATE_IDLE;
-            faultReason = "";
-            updateStatusLedForState();
-          }
+        if (chargeState == STATE_IDLE) {
+          startCharging();
+        } else if (chargeState == STATE_BULK || chargeState == STATE_ABSORPTION) {
+          stopCharging(STATE_IDLE, "Stopped by user");
+        } else { // DONE or FAULT -- acknowledge and return to idle
+          chargeState = STATE_IDLE;
+          faultReason = "";
+          updateStatusLedForState();
         }
       }
     }
@@ -657,14 +672,17 @@ void handleEncoderAndButton() {
   if (buttonStable && !buttonLongPressFired && (now - buttonPressStartMs) >= LONG_PRESS_MS) {
     buttonLongPressFired = true;
     if (chargeState == STATE_IDLE) {
-      if (uiMode == UI_MAIN) {
-        uiMode = UI_SELECT_CAPACITY;
-        capacitySelectCursor = useEasyMode ? capacityPresetIndex : CAPACITY_PRESETS_COUNT;
-        Serial.println("[ui] entering capacity/mode select");
+      useEasyMode = !useEasyMode;
+      if (useEasyMode) {
+        selectedCapacityAh = CAPACITY_PRESETS_AH[capacityPresetIndex];
+        targetCurrentA = constrain(selectedCapacityAh * BULK_CURRENT_FRACTION_OF_CAPACITY,
+                                    MANUAL_CURRENT_MIN_A, MAX_CHARGE_CURRENT_A);
       } else {
-        uiMode = UI_MAIN; // long-press again cancels back out without changes
-        Serial.println("[ui] leaving capacity select (cancelled)");
+        selectedCapacityAh = 0;
       }
+      savePersistedSettings();
+      bigOverlayUntilMs = now + BIG_OVERLAY_MODE_SWITCH_MS;
+      Serial.printf("[ui] switched to %s mode\n", useEasyMode ? "easy" : "manual");
     }
   }
 }
@@ -715,27 +733,50 @@ void drawBatteryIcon(int x, int y, int w, int h, float fraction) {
   if (fillW > 0) u8g2.drawBox(x + 2, y + 2, fillW, h - 4);
 }
 
+// Full-screen readout shown while scrolling a value or right after a
+// mode switch -- see the interaction-model comment on
+// handleEncoderAndButton(). Tries the biggest of three font sizes that
+// still fits the actual string so a short value ("3.5A") gets to fill
+// the screen while the longest possible one ("100Ah") never clips; the
+// smallest of the three (logisoso16, already used elsewhere on this
+// display) is known to fit any string this function ever produces, so
+// it's a safe last resort.
+void drawBigOverlay() {
+  char buf[16];
+  const char* label;
+  if (useEasyMode) {
+    snprintf(buf, sizeof(buf), "%uAh", selectedCapacityAh);
+    label = "Battery capacity";
+  } else {
+    snprintf(buf, sizeof(buf), "%.1fA", targetCurrentA);
+    label = "Manual current";
+  }
+
+  u8g2.setFont(u8g2_font_6x10_tf);
+  drawStrFit(0, 9, 128, label);
+  u8g2.drawHLine(0, 12, 128);
+
+  const uint8_t* bigFonts[] = {u8g2_font_logisoso32_tf, u8g2_font_logisoso24_tf, u8g2_font_logisoso16_tf};
+  const int baselineY[] = {58, 50, 40};
+  for (uint8_t i = 0; i < 3; i++) {
+    u8g2.setFont(bigFonts[i]);
+    int w = u8g2.getStrWidth(buf);
+    if (w <= 124 || i == 2) {
+      u8g2.drawStr((128 - w) / 2, baselineY[i], buf);
+      break;
+    }
+  }
+}
+
 void updateDisplay() {
   u8g2.clearBuffer();
 
-  if (uiMode == UI_SELECT_CAPACITY) {
-    u8g2.setFont(u8g2_font_6x10_tf);
-    drawStrFit(0, 10, 128, "Select capacity");
-    u8g2.setFont(u8g2_font_logisoso16_tf);
-    char buf[16];
-    if (capacitySelectCursor == CAPACITY_PRESETS_COUNT) {
-      snprintf(buf, sizeof(buf), "Manual");
-    } else {
-      snprintf(buf, sizeof(buf), "%u Ah", CAPACITY_PRESETS_AH[capacitySelectCursor]);
-    }
-    u8g2.drawStr(10, 40, buf);
-    u8g2.setFont(u8g2_font_6x10_tf);
-    drawStrFit(0, 60, 128, "Click=OK  Hold=cancel");
+  if (chargeState == STATE_IDLE && millis() < bigOverlayUntilMs) {
+    drawBigOverlay();
     u8g2.sendBuffer();
     return;
   }
 
-  // ---- UI_MAIN ----
   // Header: state name (bold) on the left, capacity/mode badge on the right
   u8g2.setFont(u8g2_font_7x13B_tr);
   u8g2.drawStr(0, 11, chargeStateName(chargeState));

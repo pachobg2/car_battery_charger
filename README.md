@@ -270,21 +270,22 @@ means more" convention, it depends on which of A/B you wired where.
 Flip it (or swap the A/B wires at the encoder, which does the same
 thing) if clockwise decreases instead of increases.
 
+No separate picker screen or confirm step — rotating applies the value
+live, and a full-screen readout pops up while you do it (see "Big
+overlay" below).
+
 - **Idle, manual mode**: rotate to adjust target charge current
-  (`MANUAL_CURRENT_STEP_A` per detent), click to start charging at that
-  current.
-- **Idle, long-press**: opens the capacity/mode picker — rotate to
-  scroll through the capacity presets in `CAPACITY_PRESETS_AH`
-  (44/50/55/60/65/70/80/85/90/100 Ah) plus one extra "Manual" entry past
-  the last preset. Click confirms whatever's showing: a capacity sets
-  target current to `BULK_CURRENT_FRACTION_OF_CAPACITY` × capacity
+  (`MANUAL_CURRENT_STEP_A` per detent) — takes effect immediately.
+  Click to start charging at that current.
+- **Idle, easy mode**: rotate to step through the capacity presets in
+  `CAPACITY_PRESETS_AH` (44/50/55/60/65/70/80/85/90/100 Ah) — each one
+  sets target current to `BULK_CURRENT_FRACTION_OF_CAPACITY` × capacity
   (C/10 by default — 10A for the 100Ah preset, see the thermal warning
-  above); "Manual" switches back to manual current entry — **this is
-  the only way back out of easy mode once a capacity's been confirmed**,
-  scroll one past the last preset to reach it. Long-press again cancels
-  back out without changing anything. The picker opens on "Manual" if
-  you're currently in manual mode, or on the current preset if you're
-  already in easy mode.
+  above), applied immediately as you turn it. Click to start charging.
+- **Idle, long-press**: instantly toggles between manual and easy mode
+  (using whichever capacity preset was last selected). No picker, no
+  confirm — the mode just switches, and the readout confirms which one
+  you're in now.
 - **While charging**: click stops immediately and returns to idle.
   Rotation and long-press are ignored while active — stop first to
   change settings.
@@ -302,16 +303,32 @@ you're driving a different/external WS2812 instead, it may need
 
 ## Display
 
-Four bands, top to bottom: state name (bold) with a capacity/manual
-badge on the right; a battery icon with SoC% and a small dot that only
-appears while actively charging; a big voltage/current readout; and a
-context line (ETA during bulk, "Topping off..." during absorption, the
-fault reason, or the target current while idle).
+The normal status screen is four bands, top to bottom: state name
+(bold) with a capacity/manual badge on the right; a battery icon with
+SoC% and a small dot that only appears while actively charging; a big
+voltage/current readout; and a context line (ETA during bulk, "Topping
+off..." during absorption, the fault reason, or the target current
+while idle).
 
-That bottom line — and the fault reason and capacity-select hint, which
-are also free-form text — are drawn through `drawStrFit()`, which
-measures the string in the current font and truncates it with "..."
-rather than letting it silently run off the right edge of the display.
+That bottom line — and the fault reason, which is also free-form text —
+is drawn through `drawStrFit()`, which measures the string in the
+current font and truncates it with "..." rather than letting it
+silently run off the right edge of the display.
+
+### Big overlay
+
+Rotating the encoder or long-pressing while idle replaces the whole
+screen with a full-screen readout (`drawBigOverlay()`) instead of the
+normal status screen — a one-line label ("Battery capacity" or "Manual
+current") plus the value itself in the biggest font that still fits
+without clipping (it tries 32pt, then 24pt, falling back to the 16pt
+font used elsewhere on this display, which is guaranteed to fit any
+value this ever shows). It auto-dismisses back to the normal screen
+`BIG_OVERLAY_SCROLL_MS` (3s default) after the last encoder tick, or
+`BIG_OVERLAY_MODE_SWITCH_MS` (2s default) after a mode-switch
+long-press — both in `config.h`. The underlying value applies live as
+you turn it; the overlay is purely a display concern; the click button
+starts/stops charging exactly the same whether or not it's showing.
 Text that's too long for a 128px-wide display isn't a hypothetical: a
 fixed-length assumption is exactly what let `"(click=start)"` and a
 couple of the longer fault-reason strings get cut off mid-word before.
@@ -347,6 +364,17 @@ a known-accurate ammeter, given the custom shunt) that measured
 voltage/current match the OLED and Serial readings before leaving it
 unattended.
 
+One specific thing I couldn't verify: `drawBigOverlay()` uses
+`u8g2_font_logisoso32_tf` and `u8g2_font_logisoso24_tf` for the
+full-screen readout, on top of the `u8g2_font_logisoso16_tf` already
+used elsewhere and confirmed working on your build. I'm confident the
+logisoso family includes these sizes, but haven't compiled against them
+specifically — if either name doesn't exist in your installed U8g2
+version, the compiler error will name the missing font; check
+[U8g2's font list](https://github.com/olikraus/u8g2/wiki/fntlistall)
+for the closest available size in that family and swap it into the
+`bigFonts[]` array.
+
 ## Version History
 
 | Version | Date | Changes |
@@ -360,3 +388,4 @@ unattended.
 | v1.5.0 | 2026-09-19 | Fixed the status LED: wrong color order (`NEO_GRB` instead of the `NEO_RGB` Waveshare's own docs specify for the ESP32-C3-Zero's onboard WS2812) and added a boot-time Serial message so a missing `Adafruit_NeoPixel` library -- which silently compiles the whole LED code path out via `__has_include()`, with no other symptom -- is diagnosable instead of just "the LED does nothing." Redesigned the OLED layout: battery icon with SoC%, bold header with a capacity/manual badge, bigger voltage/current readout, and a `drawStrFit()` helper that measures and truncates any status text instead of letting it silently run off the display edge (fixes `"(click=start)"` and several fault-reason strings getting cut off). |
 | v1.6.0 | 2026-09-19 | `ENCODER_REVERSED` default flipped to `false` (confirmed correct on the actual build). Fixed the capacity-select screen's header text overflowing the display uncaught (`u8g2.drawStr()` instead of `drawStrFit()`) and shortened the confirm/cancel hint so it fits without truncating mid-word. Added a "Manual" entry past the last capacity preset in the picker -- previously, once a capacity was confirmed there was no way back to manual current entry at all; scroll one past the last preset and click to get back. |
 | v1.6.1 | 2026-09-19 | Widened the battery icon roughly 4x (20px to 86px body width) for a more readable charge-progress indicator; `drawBatteryIcon()` now takes explicit width/height parameters instead of hardcoded dimensions. Repositioned the SoC% text and charging-indicator dot to make room. |
+| v1.7.0 | 2026-09-19 | Replaced the picker-with-confirm capacity/mode UI entirely: rotating the encoder now applies the value live (no confirm step) and shows a full-screen readout (`drawBigOverlay()`, biggest font that fits) that auto-dismisses 3s after the last tick; long-press instantly toggles manual/easy mode instead of opening a picker, showing the same readout for 2s. Removed `UiMode`/`uiMode` and the capacity-select screen entirely -- this also structurally closes the "no way to exit" class of bug from the old modal picker, since there's no longer a separate mode to get stuck in. Added `BIG_OVERLAY_SCROLL_MS`/`BIG_OVERLAY_MODE_SWITCH_MS`. |
