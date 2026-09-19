@@ -356,16 +356,29 @@ float readBatteryVoltage() {
 }
 
 // ------------------------------------------------------------------
-// Persistence (NVS) -- only the last manual/easy-mode selection.
-// Charging itself never resumes automatically after a reboot.
+// Persistence (NVS) -- last manual/easy-mode selection, capacity
+// preset, and target current, so the device comes back up the way you
+// left it. Charging progress itself never resumes automatically after
+// a reboot, deliberately -- see startCharging()/setup().
+//
+// prefs.begin() returns false on failure (e.g. a namespace name over
+// ESP-IDF's 15-character NVS limit -- exactly what silently broke this
+// before) and that return value is checked here; if it ever fails
+// again, the Serial Monitor will say so instead of settings just quietly
+// not sticking.
 // ------------------------------------------------------------------
 void loadPersistedSettings() {
-  prefs.begin(DEVICE_ID, /*readOnly=*/false);
+  if (!prefs.begin(DEVICE_ID, /*readOnly=*/false)) {
+    Serial.println("[nvs] FAILED to open Preferences namespace -- using compiled defaults, settings will not persist");
+    return;
+  }
   useEasyMode = prefs.getBool("easyMode", false);
   capacityPresetIndex = prefs.getUChar("capIdx", DEFAULT_CAPACITY_PRESET_INDEX);
   if (capacityPresetIndex >= CAPACITY_PRESETS_COUNT) capacityPresetIndex = DEFAULT_CAPACITY_PRESET_INDEX;
   targetCurrentA = prefs.getFloat("targetA", DEFAULT_MANUAL_CURRENT_A);
   prefs.end();
+  Serial.printf("[nvs] loaded: %s mode, capacity index %u, target %.2fA\n",
+                useEasyMode ? "easy" : "manual", capacityPresetIndex, targetCurrentA);
 
   if (useEasyMode) {
     selectedCapacityAh = CAPACITY_PRESETS_AH[capacityPresetIndex];
@@ -377,7 +390,10 @@ void loadPersistedSettings() {
 }
 
 void savePersistedSettings() {
-  prefs.begin(DEVICE_ID, /*readOnly=*/false);
+  if (!prefs.begin(DEVICE_ID, /*readOnly=*/false)) {
+    Serial.println("[nvs] FAILED to open Preferences namespace -- settings will not persist");
+    return;
+  }
   prefs.putBool("easyMode", useEasyMode);
   prefs.putUChar("capIdx", capacityPresetIndex);
   prefs.putFloat("targetA", targetCurrentA);

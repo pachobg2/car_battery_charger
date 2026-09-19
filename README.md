@@ -301,6 +301,21 @@ Waveshare's own docs specify for the ESP32-C3-Zero's onboard WS2812. If
 you're driving a different/external WS2812 instead, it may need
 `NEO_GRB` back.
 
+### Persisted settings
+
+Mode (manual/easy), the selected capacity preset, and the manual target
+current are saved to NVS (via `Preferences`) whenever they change, and
+restored at boot — the device comes back up the way you left it rather
+than resetting to `config.h`'s defaults every power cycle. The Serial
+Monitor logs what it loaded at boot (`[nvs] loaded: ...`), and logs a
+clear failure message on either load or save if the NVS namespace can't
+be opened, rather than settings just silently failing to stick.
+
+Charging progress itself is the one thing that's deliberately **not**
+persisted — a fresh boot always comes up `Idle` regardless of what was
+happening before, and starting a charge always requires an explicit
+click. See "Charge algorithm" above for why.
+
 ## Display
 
 The normal status screen is four bands, top to bottom: state name
@@ -389,3 +404,4 @@ for the closest available size in that family and swap it into the
 | v1.6.0 | 2026-09-19 | `ENCODER_REVERSED` default flipped to `false` (confirmed correct on the actual build). Fixed the capacity-select screen's header text overflowing the display uncaught (`u8g2.drawStr()` instead of `drawStrFit()`) and shortened the confirm/cancel hint so it fits without truncating mid-word. Added a "Manual" entry past the last capacity preset in the picker -- previously, once a capacity was confirmed there was no way back to manual current entry at all; scroll one past the last preset and click to get back. |
 | v1.6.1 | 2026-09-19 | Widened the battery icon roughly 4x (20px to 86px body width) for a more readable charge-progress indicator; `drawBatteryIcon()` now takes explicit width/height parameters instead of hardcoded dimensions. Repositioned the SoC% text and charging-indicator dot to make room. |
 | v1.7.0 | 2026-09-19 | Replaced the picker-with-confirm capacity/mode UI entirely: rotating the encoder now applies the value live (no confirm step) and shows a full-screen readout (`drawBigOverlay()`, biggest font that fits) that auto-dismisses 3s after the last tick; long-press instantly toggles manual/easy mode instead of opening a picker, showing the same readout for 2s. Removed `UiMode`/`uiMode` and the capacity-select screen entirely -- this also structurally closes the "no way to exit" class of bug from the old modal picker, since there's no longer a separate mode to get stuck in. Added `BIG_OVERLAY_SCROLL_MS`/`BIG_OVERLAY_MODE_SWITCH_MS`. |
+| v1.8.0 | 2026-09-19 | Fixed persisted settings (mode/capacity/target current) never actually saving: `DEVICE_ID` ("car_battery_charger1", 20 chars) exceeded ESP-IDF's 15-character NVS namespace limit, so every `prefs.begin()` call was failing -- silently, since the return value was never checked. Shortened `DEVICE_ID` to `"cbc1"` and added error checking with a Serial Monitor message on both load and save, so a namespace failure is diagnosable instead of settings just quietly resetting to defaults every boot. |

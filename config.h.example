@@ -8,8 +8,13 @@
 // ------------------------------------------------------------------
 // Device identity
 // ------------------------------------------------------------------
-static const char* DEVICE_ID        = "car_battery_charger1"; // NVS (Preferences) namespace
-static const char* FIRMWARE_VERSION = "1.7.0";
+// NVS (Preferences) namespace -- ESP-IDF caps namespace names at 15
+// characters. "car_battery_charger1" (20 chars) silently exceeded that:
+// prefs.begin() was failing on every boot, its return value was never
+// checked, so settings were never actually persisting despite the code
+// looking complete. Keep this at 15 characters or fewer if you rename it.
+static const char* DEVICE_ID        = "cbc1";
+static const char* FIRMWARE_VERSION = "1.8.0";
 
 // ------------------------------------------------------------------
 // Hardware -- I2C bus (INA219 current/voltage sensor + SH1106 OLED)
