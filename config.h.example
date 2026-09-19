@@ -277,7 +277,7 @@ static const uint8_t DEFAULT_CAPACITY_PRESET_INDEX = 3; // 60Ah, a common car-ba
 // Manual-mode current selection (encoder-adjustable when not using a
 // capacity preset)
 // ------------------------------------------------------------------
-static const float MANUAL_CURRENT_STEP_A = 0.1f;
+static const float MANUAL_CURRENT_STEP_A = 0.5f;
 static const float MANUAL_CURRENT_MIN_A  = 0.2f;
 static const float DEFAULT_MANUAL_CURRENT_A = 1.0f;
 
