@@ -106,7 +106,10 @@ Preferences prefs;
 Adafruit_INA219 ina219(INA219_I2C_ADDR);
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /*reset=*/U8X8_PIN_NONE);
 #if __has_include(<Adafruit_NeoPixel.h>)
-Adafruit_NeoPixel statusLed(1, STATUS_LED_PIN, NEO_GRB + NEO_KHZ800);
+// NEO_RGB, not NEO_GRB -- Waveshare's own docs for the ESP32-C3-Zero
+// specify RGB color order for its onboard WS2812, not the more common
+// GRB. Wrong order gives wrong colors, not a dead LED, but it's wrong.
+Adafruit_NeoPixel statusLed(1, STATUS_LED_PIN, NEO_RGB + NEO_KHZ800);
 #endif
 
 ChargeState chargeState = STATE_IDLE;
@@ -168,6 +171,8 @@ void startCharging();
 void stopCharging(ChargeState endState, const String &reason);
 void controlLoop();
 void updateDisplay();
+void drawStrFit(int x, int y, int maxWidth, const char* text);
+void drawBatteryIcon(int x, int y, float fraction);
 void handleEncoderAndButton();
 void applyGateDuty(uint16_t duty);
 float estimateSocFromOcv(float v);
@@ -655,64 +660,113 @@ void handleEncoderAndButton() {
 // ------------------------------------------------------------------
 // Display
 // ------------------------------------------------------------------
-void drawProgressBar(int x, int y, int w, int h, float fraction) {
+
+// Draws text truncated with "..." if it would exceed maxWidth pixels in
+// the currently selected font. This is a general safety net, not a
+// one-off string fix: a fixed-length assumption is exactly what let
+// "(click=start)" and several fault-reason strings silently run off the
+// right edge of a 128px display before -- this makes that class of bug
+// structurally impossible instead of relying on hand-counting characters
+// for every string, forever, including ones added later.
+void drawStrFit(int x, int y, int maxWidth, const char* text) {
+  if (u8g2.getStrWidth(text) <= maxWidth) {
+    u8g2.drawStr(x, y, text);
+    return;
+  }
+  char buf[48];
+  size_t len = strlen(text);
+  if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+  memcpy(buf, text, len);
+  buf[len] = '\0';
+  while (len > 0) {
+    len--;
+    buf[len] = '\0';
+    String withDots = String(buf) + "...";
+    if (u8g2.getStrWidth(withDots.c_str()) <= maxWidth) {
+      u8g2.drawStr(x, y, withDots.c_str());
+      return;
+    }
+  }
+  u8g2.drawStr(x, y, "...");
+}
+
+// Simple hand-drawn battery glyph (body + terminal nub + a fill bar
+// proportional to fraction) rather than a generic progress bar -- reads
+// at a glance as "this is the battery's charge level" the way a plain
+// rectangle doesn't. Occupies a 24x11px footprint at (x, y).
+void drawBatteryIcon(int x, int y, float fraction) {
   fraction = constrain(fraction, 0.0f, 1.0f);
-  u8g2.drawFrame(x, y, w, h);
-  int fillW = (int)((w - 2) * fraction);
-  if (fillW > 0) u8g2.drawBox(x + 1, y + 1, fillW, h - 2);
+  u8g2.drawFrame(x, y, 20, 11);
+  u8g2.drawBox(x + 20, y + 3, 3, 5);
+  int fillW = (int)(16 * fraction);
+  if (fillW > 0) u8g2.drawBox(x + 2, y + 2, fillW, 7);
 }
 
 void updateDisplay() {
   u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_6x10_tf);
 
   if (uiMode == UI_SELECT_CAPACITY) {
-    u8g2.drawStr(0, 10, "Select battery (Ah):");
-    u8g2.setFont(u8g2_font_10x20_tf);
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(0, 10, "Select battery capacity:");
+    u8g2.setFont(u8g2_font_logisoso16_tf);
     char buf[16];
     snprintf(buf, sizeof(buf), "%u Ah", CAPACITY_PRESETS_AH[capacitySelectCursor]);
-    u8g2.drawStr(10, 35, buf);
+    u8g2.drawStr(10, 40, buf);
     u8g2.setFont(u8g2_font_6x10_tf);
-    u8g2.drawStr(0, 55, "Click=confirm  Hold=cancel");
+    drawStrFit(0, 60, 128, "Click = confirm, hold = cancel");
     u8g2.sendBuffer();
     return;
   }
 
   // ---- UI_MAIN ----
-  u8g2.drawStr(0, 10, chargeStateName(chargeState));
-  if (useEasyMode) {
-    char cap[16];
-    snprintf(cap, sizeof(cap), "%uAh", selectedCapacityAh);
-    u8g2.drawStr(90, 10, cap);
+  // Header: state name (bold) on the left, capacity/mode badge on the right
+  u8g2.setFont(u8g2_font_7x13B_tr);
+  u8g2.drawStr(0, 11, chargeStateName(chargeState));
+  char badge[12];
+  if (useEasyMode) snprintf(badge, sizeof(badge), "%uAh", selectedCapacityAh);
+  else snprintf(badge, sizeof(badge), "MANUAL");
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(128 - u8g2.getStrWidth(badge), 10, badge);
+  u8g2.drawHLine(0, 13, 128);
+
+  // Battery icon + SoC%, with a small dot while actively charging
+  drawBatteryIcon(0, 17, socFraction);
+  char socStr[8];
+  snprintf(socStr, sizeof(socStr), "%.0f%%", socFraction * 100.0f);
+  u8g2.drawStr(30, 27, socStr);
+  if (chargeState == STATE_BULK || chargeState == STATE_ABSORPTION) {
+    u8g2.drawDisc(60, 23, 2);
   }
 
-  drawProgressBar(0, 14, 128, 10, socFraction);
-
-  char line[32];
+  // Big voltage / current readout, side by side
+  char line[16];
   u8g2.setFont(u8g2_font_10x20_tf);
   snprintf(line, sizeof(line), "%.2fV", busVoltage);
-  u8g2.drawStr(0, 42, line);
-  snprintf(line, sizeof(line), "%.2fA", busCurrent);
-  u8g2.drawStr(70, 42, line);
+  u8g2.drawStr(0, 48, line);
+  snprintf(line, sizeof(line), "%.1fA", busCurrent);
+  u8g2.drawStr(68, 48, line);
 
+  // Bottom context line -- always width-checked, never assumed to fit
   u8g2.setFont(u8g2_font_6x10_tf);
   if (chargeState == STATE_FAULT) {
-    u8g2.drawStr(0, 55, faultReason.c_str());
+    drawStrFit(0, 62, 128, faultReason.c_str());
   } else if (chargeState == STATE_DONE) {
-    u8g2.drawStr(0, 55, "Charged - click to reset");
+    drawStrFit(0, 62, 128, "Charged -- click to reset");
   } else if (chargeState == STATE_ABSORPTION) {
-    u8g2.drawStr(0, 55, "Topping off...");
+    drawStrFit(0, 62, 128, "Topping off...");
   } else if (chargeState == STATE_BULK) {
     float remainingAh = max(0.0f, (1.0f - socFraction)) *
         (selectedCapacityAh > 0 ? selectedCapacityAh : (targetCurrentA / BULK_CURRENT_FRACTION_OF_CAPACITY));
     float etaHours = (busCurrent > 0.05f) ? (remainingAh / busCurrent) : 0.0f;
     int hh = (int)etaHours;
     int mm = (int)((etaHours - hh) * 60);
-    snprintf(line, sizeof(line), "ETA to absorb ~%dh%02dm", hh, mm);
-    u8g2.drawStr(0, 55, line);
+    char etaLine[24];
+    snprintf(etaLine, sizeof(etaLine), "ETA ~%dh%02dm to absorb", hh, mm);
+    drawStrFit(0, 62, 128, etaLine);
   } else { // IDLE
-    snprintf(line, sizeof(line), "Target: %.1fA  (click=start)", targetCurrentA);
-    u8g2.drawStr(0, 55, line);
+    char idleLine[24];
+    snprintf(idleLine, sizeof(idleLine), "%.1fA - click to start", targetCurrentA);
+    drawStrFit(0, 62, 128, idleLine);
   }
 
   u8g2.sendBuffer();
@@ -748,7 +802,14 @@ void setup() {
   if (STATUS_LED_ENABLED) {
     statusLed.begin();
     statusLed.show();
+    Serial.println("[led] status LED initialized on GPIO" + String(STATUS_LED_PIN));
   }
+#else
+  // If this prints, the status LED can never work no matter what else is
+  // right -- __has_include() compiles the entire NeoPixel code path out
+  // when the library isn't installed, silently, with no other symptom.
+  Serial.println("[led] Adafruit_NeoPixel library NOT installed -- status LED will not work. "
+                  "Install \"Adafruit NeoPixel\" via Library Manager and re-flash.");
 #endif
 
   if (BUZZER_ENABLED) {

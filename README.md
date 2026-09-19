@@ -28,8 +28,13 @@ battery voltage directly.
 2. **Libraries** (Library Manager):
    - `Adafruit INA219` by Adafruit
    - `U8g2` by olikraus
-   - `Adafruit NeoPixel` by Adafruit (only needed if your board has the
-     onboard status LED and `STATUS_LED_ENABLED` is `true`)
+   - `Adafruit NeoPixel` by Adafruit (needed if `STATUS_LED_ENABLED` is
+     `true`, the default -- **if you skip this, the status LED silently
+     does nothing.** `__has_include()` compiles the whole NeoPixel code
+     path out when the library isn't found, with no compile error and no
+     other symptom. The Serial Monitor prints which way it went at boot
+     -- "status LED initialized on GPIOx" or a library-missing warning --
+     check that first if the LED never lights up.)
    Built-in: `Preferences`, `Wire`.
 3. Select board **"ESP32C3 Dev Module"**, and under Tools set **USB CDC
    On Boot: Enabled** (needed for Serial over native USB).
@@ -284,6 +289,27 @@ blue = idle, yellow = bulk, orange = absorption, green = done, red =
 fault. The buzzer backs this up audibly — see "Piezo buzzer" above — so
 a state change registers even if you're not looking at the device.
 
+Uses `NEO_RGB` color order, not the more common `NEO_GRB` — that's what
+Waveshare's own docs specify for the ESP32-C3-Zero's onboard WS2812. If
+you're driving a different/external WS2812 instead, it may need
+`NEO_GRB` back.
+
+## Display
+
+Four bands, top to bottom: state name (bold) with a capacity/manual
+badge on the right; a battery icon with SoC% and a small dot that only
+appears while actively charging; a big voltage/current readout; and a
+context line (ETA during bulk, "Topping off..." during absorption, the
+fault reason, or the target current while idle).
+
+That bottom line — and the fault reason and capacity-select hint, which
+are also free-form text — are drawn through `drawStrFit()`, which
+measures the string in the current font and truncates it with "..."
+rather than letting it silently run off the right edge of the display.
+Text that's too long for a 128px-wide display isn't a hypothetical: a
+fixed-length assumption is exactly what let `"(click=start)"` and a
+couple of the longer fault-reason strings get cut off mid-word before.
+
 ## Tuning the control loop
 
 Open the Serial Monitor at 115200 baud while charging — the control loop
@@ -325,3 +351,4 @@ unattended.
 | v1.3.0 | 2026-09-18 | Added a piezo buzzer (GPIO8) with a non-blocking tone sequencer (`updateBuzzer()`): distinct patterns for charge start, charge complete, fault/refused start, and manual stop. |
 | v1.3.1 | 2026-09-19 | Fixed a compile error: `Adafruit_INA219.h` already `#define`s `INA219_REG_CALIBRATION`/`INA219_REG_CURRENT` itself, and this sketch's own `static const` declarations of the same names collided with those macros at preprocessing. Removed the redundant declarations; the register writes now just use the library's own macros directly. |
 | v1.4.0 | 2026-09-19 | Fixed encoder bouncing/jumping: replaced the naive "compare A and B on every A edge" decoder with a full quadrature state-table decoder driven by interrupts on both A and B, which structurally rejects mechanical contact bounce instead of counting every raw edge. Added `ENCODER_REVERSED` to flip rotation direction (clockwise was decreasing current; defaults to `true` now so clockwise increases it). |
+| v1.5.0 | 2026-09-19 | Fixed the status LED: wrong color order (`NEO_GRB` instead of the `NEO_RGB` Waveshare's own docs specify for the ESP32-C3-Zero's onboard WS2812) and added a boot-time Serial message so a missing `Adafruit_NeoPixel` library -- which silently compiles the whole LED code path out via `__has_include()`, with no other symptom -- is diagnosable instead of just "the LED does nothing." Redesigned the OLED layout: battery icon with SoC%, bold header with a capacity/manual badge, bigger voltage/current readout, and a `drawStrFit()` helper that measures and truncates any status text instead of letting it silently run off the display edge (fixes `"(click=start)"` and several fault-reason strings getting cut off). |
