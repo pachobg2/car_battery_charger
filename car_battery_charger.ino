@@ -172,7 +172,7 @@ void stopCharging(ChargeState endState, const String &reason);
 void controlLoop();
 void updateDisplay();
 void drawStrFit(int x, int y, int maxWidth, const char* text);
-void drawBatteryIcon(int x, int y, float fraction);
+void drawBatteryIcon(int x, int y, int w, int h, float fraction);
 void handleEncoderAndButton();
 void applyGateDuty(uint16_t duty);
 float estimateSocFromOcv(float v);
@@ -705,13 +705,14 @@ void drawStrFit(int x, int y, int maxWidth, const char* text) {
 // Simple hand-drawn battery glyph (body + terminal nub + a fill bar
 // proportional to fraction) rather than a generic progress bar -- reads
 // at a glance as "this is the battery's charge level" the way a plain
-// rectangle doesn't. Occupies a 24x11px footprint at (x, y).
-void drawBatteryIcon(int x, int y, float fraction) {
+// rectangle doesn't. Occupies a (w+3)xh px footprint at (x, y); w is the
+// body width (excluding the terminal nub).
+void drawBatteryIcon(int x, int y, int w, int h, float fraction) {
   fraction = constrain(fraction, 0.0f, 1.0f);
-  u8g2.drawFrame(x, y, 20, 11);
-  u8g2.drawBox(x + 20, y + 3, 3, 5);
-  int fillW = (int)(16 * fraction);
-  if (fillW > 0) u8g2.drawBox(x + 2, y + 2, fillW, 7);
+  u8g2.drawFrame(x, y, w, h);
+  u8g2.drawBox(x + w, y + (h - 5) / 2, 3, 5);
+  int fillW = (int)((w - 4) * fraction);
+  if (fillW > 0) u8g2.drawBox(x + 2, y + 2, fillW, h - 4);
 }
 
 void updateDisplay() {
@@ -745,13 +746,14 @@ void updateDisplay() {
   u8g2.drawStr(128 - u8g2.getStrWidth(badge), 10, badge);
   u8g2.drawHLine(0, 13, 128);
 
-  // Battery icon + SoC%, with a small dot while actively charging
-  drawBatteryIcon(0, 17, socFraction);
+  // Battery icon (~4x its original length) + SoC%, with a small dot
+  // while actively charging
+  drawBatteryIcon(0, 17, 86, 11, socFraction);
   char socStr[8];
   snprintf(socStr, sizeof(socStr), "%.0f%%", socFraction * 100.0f);
-  u8g2.drawStr(30, 27, socStr);
+  u8g2.drawStr(94, 27, socStr);
   if (chargeState == STATE_BULK || chargeState == STATE_ABSORPTION) {
-    u8g2.drawDisc(60, 23, 2);
+    u8g2.drawDisc(123, 23, 2);
   }
 
   // Big voltage / current readout, side by side
