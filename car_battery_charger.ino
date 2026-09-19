@@ -283,10 +283,11 @@ void updateBuzzer() {
 // getCurrent_mA() would silently use the wrong scale factor for this
 // shunt -- instead we write the calibration register ourselves and read
 // the raw current register directly, scaling by our own Current_LSB.
+// INA219_REG_CALIBRATION/INA219_REG_CURRENT are #defined by
+// Adafruit_INA219.h itself (as 0x05/0x04) -- used directly below rather
+// than redeclared, since redeclaring the same names as our own constants
+// collides with the library's #define at the preprocessor level.
 // ------------------------------------------------------------------
-static const uint8_t INA219_REG_CALIBRATION = 0x05;
-static const uint8_t INA219_REG_CURRENT     = 0x04;
-
 void ina219WriteCalibration(uint16_t calValue) {
   Wire.beginTransmission(INA219_I2C_ADDR);
   Wire.write(INA219_REG_CALIBRATION);
