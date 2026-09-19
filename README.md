@@ -216,8 +216,8 @@ every charge state transition:
 - **Charging starts** — a short rising chirp.
 - **Charge completes** — a rising triple beep.
 - **Fault, including a refused start** (no battery detected, voltage
-  already too high, over-voltage/over-current/timeout) — a low triple
-  beep.
+  already too high, over-voltage/over-current/timeout) — a high-pitched
+  triple beep.
 - **Manual stop** — a single neutral click.
 
 Patterns are plain frequency/duration arrays in `config.h` (`BUZZER_START_*`,
