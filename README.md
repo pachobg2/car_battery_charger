@@ -149,11 +149,15 @@ insurance against real failure modes:
   design's topology; that's deliberately simpler than a P-channel MOSFET
   reverse-protection circuit, which would need to be re-derived carefully
   for this specific low-side-MOSFET layout to get the gate bias direction
-  right. Size the diode for your real max current, not just a token
-  rating — a 1N5822 (3A) is nowhere near enough for a 10A charger; look
-  for something rated at least 1.5x your actual ceiling, in a package
-  you can heatsink (it will dissipate real power: `0.3–0.5V × current`,
-  the same physics as the reverse-polarity diode in any other design).
+  right. **Use a diode actually rated for this current** — an
+  **SB1560** (15A, 60V, TO-220 Schottky) or equivalent from the same
+  "SB15xx" family gives comfortable margin over the 10A ceiling (~1.5x)
+  and over the 26V supply (60V, more than double). A 1N5822 (3A) is not
+  even close to enough here and would fail — it was a placeholder value
+  I initially put in the schematic without sizing it, since fixed. Put
+  it on a heatsink (its own or shared with the MOSFETs): it dissipates
+  real power, `0.3–0.5V × current`, same physics as the reverse-polarity
+  diode in any other design.
 
 ### MOSFET bank — 4x IRL540N in parallel, current-shared
 
