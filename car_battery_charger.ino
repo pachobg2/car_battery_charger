@@ -101,7 +101,8 @@
  *   - U8g2 (olikraus)
  *   - OneWire (Paul Stoffregen) and DallasTemperature (Miles Burton) --
  *     for the DS18B20 heatsink sensor
- *   - Adafruit NeoPixel (adafruit) -- only if STATUS_LED_ENABLED
+ *   - Adafruit NeoPixel (adafruit) -- required to build regardless of
+ *     STATUS_LED_ENABLED
  *   Built-in / come with the ESP32 Arduino core: Preferences, Wire
  *
  * Board package: esp32 by Espressif Systems -- board "ESP32C3 Dev
@@ -117,9 +118,7 @@
 #include <U8g2lib.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#if __has_include(<Adafruit_NeoPixel.h>)
 #include <Adafruit_NeoPixel.h>
-#endif
 
 #include "config.h"
 
@@ -146,12 +145,10 @@ const char* chargeStateName(ChargeState s) {
 Preferences prefs;
 Adafruit_INA219 ina219(INA219_I2C_ADDR);
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /*reset=*/U8X8_PIN_NONE);
-#if __has_include(<Adafruit_NeoPixel.h>)
 // NEO_RGB, not NEO_GRB -- Waveshare's own docs for the ESP32-C3-Zero
 // specify RGB color order for its onboard WS2812, not the more common
 // GRB. Wrong order gives wrong colors, not a dead LED, but it's wrong.
 Adafruit_NeoPixel statusLed(1, STATUS_LED_PIN, NEO_RGB + NEO_KHZ800);
-#endif
 OneWire oneWire(DS18B20_PIN);
 DallasTemperature heatsinkTempSensor(&oneWire);
 
@@ -316,11 +313,9 @@ float estimateSocFromOcv(float v) {
 }
 
 void setStatusLed(uint8_t r, uint8_t g, uint8_t b) {
-#if __has_include(<Adafruit_NeoPixel.h>)
   if (!STATUS_LED_ENABLED) return;
   statusLed.setPixelColor(0, statusLed.Color(r, g, b));
   statusLed.show();
-#endif
 }
 
 void updateStatusLedForState() {
@@ -1230,19 +1225,11 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ENCODER_A_PIN), onEncoderChange, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENCODER_B_PIN), onEncoderChange, CHANGE);
 
-#if __has_include(<Adafruit_NeoPixel.h>)
   if (STATUS_LED_ENABLED) {
     statusLed.begin();
     statusLed.show();
     Serial.println("[led] status LED initialized on GPIO" + String(STATUS_LED_PIN));
   }
-#else
-  // If this prints, the status LED can never work no matter what else is
-  // right -- __has_include() compiles the entire NeoPixel code path out
-  // when the library isn't installed, silently, with no other symptom.
-  Serial.println("[led] Adafruit_NeoPixel library NOT installed -- status LED will not work. "
-                  "Install \"Adafruit NeoPixel\" via Library Manager and re-flash.");
-#endif
 
   if (BUZZER_ENABLED) {
     pinMode(BUZZER_PIN, OUTPUT);

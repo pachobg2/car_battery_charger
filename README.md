@@ -32,13 +32,13 @@ battery voltage directly.
    - `U8g2` by olikraus
    - `OneWire` by Paul Stoffregen and `DallasTemperature` by Miles
      Burton -- for the DS18B20 heatsink sensor
-   - `Adafruit NeoPixel` by Adafruit (needed if `STATUS_LED_ENABLED` is
-     `true`, the default -- **if you skip this, the status LED silently
-     does nothing.** `__has_include()` compiles the whole NeoPixel code
-     path out when the library isn't found, with no compile error and no
-     other symptom. The Serial Monitor prints which way it went at boot
-     -- "status LED initialized on GPIOx" or a library-missing warning --
-     check that first if the LED never lights up.)
+   - `Adafruit NeoPixel` by Adafruit -- required to build at all now,
+     regardless of `STATUS_LED_ENABLED`. (An earlier version made this
+     optional via `__has_include()`, silently compiling the whole
+     NeoPixel code path out with no compile error when the library
+     wasn't found -- just a dead LED and a boot-time Serial line as the
+     only clue. That guard is gone; a missing library is now a normal
+     compile error.)
    Built-in: `Preferences`, `Wire`.
 3. Select board **"ESP32C3 Dev Module"**, and under Tools set **USB CDC
    On Boot: Enabled** (needed for Serial over native USB).
@@ -595,3 +595,4 @@ for the closest available size in that family and swap it into the
 | v1.9.2 | 2026-09-21 | v1.9.1 raised the shared baseline table, which regressed the capacity/current overlay's positioning too -- it never had an overlap problem, only the fault screen did. `drawBigCentered()` now takes its baseline array as a parameter instead of a hardcoded shared one; the overlay keeps its original {58,50,40}, the fault screen keeps the raised {48,42,34}. |
 | v1.10.0 | 2026-09-21 | Added 3/5/10Ah to the capacity presets (small SLA batteries, not just full-size car batteries) -- `DEFAULT_CAPACITY_PRESET_INDEX` shifted from 3 to 6 to keep pointing at 60Ah. Added a new Recovery stage (`STATE_RECOVERY`) for batteries resting below `RECOVERY_ENTRY_VOLTAGE_THRESHOLD` (8V default) -- previously refused outright as "no battery detected"; now attempts a cautious, much lower current first (since a shorted cell can read in this same range, and full bulk current into a short is how a battery ruptures), graduating to Bulk once it recovers past `RECOVERY_EXIT_VOLTAGE` (10V) or faulting as unresponsive after `RECOVERY_TIMEOUT_MS` (30 min). `NO_BATTERY_VOLTAGE_THRESHOLD` (the real "nothing plausible connected" floor) lowered from 8V to 2V accordingly. |
 | v1.11.0 | 2026-09-21 | Four additions: (1) a DS18B20 heatsink sensor (OneWire, GPIO2) gives a real runtime over-temperature cutoff (`MAX_HEATSINK_TEMP_C`, 80C default) instead of relying on someone watching the heatsink -- non-blocking (`updateHeatsinkTemp()`), refuses to start without the sensor by default (`REQUIRE_HEATSINK_SENSOR`); (2) a fuse and a reverse-polarity diode in the battery+ lead, hardware-only (schematic updated), with the supply-voltage divider's sense tap relocated to *after* both so the diode's forward drop doesn't skew every reading; (3) Recovery now checks its own progress at `RECOVERY_CHECK_MS` (5 min) and faults early if voltage hasn't risen `RECOVERY_MIN_RISE_V` (0.15V), instead of always waiting the full 30-minute timeout on a battery with a shorted cell; (4) a live divider-calibration mode (hold the button, turn the encoder) tunes `SUPPLY_DIVIDER_RATIO` against a multimeter and saves to NVS without a reflash. Also fixed real overlap bugs in the schematic: the 100R gate-stopper resistors overlapped the MOSFET boxes in all four columns (a 12px encroachment that was there since the diagram's first version), and did a full coordinate re-audit while adding the fuse/diode/DS18B20 to it. |
+| v1.11.1 | 2026-09-21 | Removed the `__has_include(<Adafruit_NeoPixel.h>)` guard entirely -- the library is now a hard, unconditional `#include`. It was letting the sketch silently compile with zero LED code whenever the library wasn't visible to the compiler, with only a boot-time Serial line as a clue; a user had it installed and the LED still didn't work, tracing back to this. A missing library is now a normal compile error instead of a silent no-op. |
