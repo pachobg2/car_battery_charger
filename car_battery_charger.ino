@@ -145,10 +145,12 @@ const char* chargeStateName(ChargeState s) {
 Preferences prefs;
 Adafruit_INA219 ina219(INA219_I2C_ADDR);
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /*reset=*/U8X8_PIN_NONE);
-// NEO_RGB, not NEO_GRB -- Waveshare's own docs for the ESP32-C3-Zero
-// specify RGB color order for its onboard WS2812, not the more common
-// GRB. Wrong order gives wrong colors, not a dead LED, but it's wrong.
-Adafruit_NeoPixel statusLed(1, STATUS_LED_PIN, NEO_RGB + NEO_KHZ800);
+// NEO_GRB -- Waveshare's docs for the ESP32-C3-Zero claim NEO_RGB for
+// its onboard WS2812, but that was wrong on the actual unit: fault
+// showed green and (would have) made DONE show red, an exact R/G swap.
+// Confirmed GRB on real hardware; change back to NEO_RGB only if you
+// swap in a different WS2812 module that actually needs it.
+Adafruit_NeoPixel statusLed(1, STATUS_LED_PIN, NEO_GRB + NEO_KHZ800);
 OneWire oneWire(DS18B20_PIN);
 DallasTemperature heatsinkTempSensor(&oneWire);
 

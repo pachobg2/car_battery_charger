@@ -419,10 +419,11 @@ green = done, red = fault. The buzzer backs this up audibly — see
 "Piezo buzzer" above — so
 a state change registers even if you're not looking at the device.
 
-Uses `NEO_RGB` color order, not the more common `NEO_GRB` — that's what
-Waveshare's own docs specify for the ESP32-C3-Zero's onboard WS2812. If
-you're driving a different/external WS2812 instead, it may need
-`NEO_GRB` back.
+Uses `NEO_GRB` color order. Waveshare's own docs for the ESP32-C3-Zero's
+onboard WS2812 claim `NEO_RGB`, but that was wrong on real hardware —
+fault showed green instead of red (an R/G swap; confirmed by testing).
+If you're driving a different/external WS2812 module, it may need
+`NEO_RGB` instead.
 
 ### Persisted settings
 
@@ -596,3 +597,4 @@ for the closest available size in that family and swap it into the
 | v1.10.0 | 2026-09-21 | Added 3/5/10Ah to the capacity presets (small SLA batteries, not just full-size car batteries) -- `DEFAULT_CAPACITY_PRESET_INDEX` shifted from 3 to 6 to keep pointing at 60Ah. Added a new Recovery stage (`STATE_RECOVERY`) for batteries resting below `RECOVERY_ENTRY_VOLTAGE_THRESHOLD` (8V default) -- previously refused outright as "no battery detected"; now attempts a cautious, much lower current first (since a shorted cell can read in this same range, and full bulk current into a short is how a battery ruptures), graduating to Bulk once it recovers past `RECOVERY_EXIT_VOLTAGE` (10V) or faulting as unresponsive after `RECOVERY_TIMEOUT_MS` (30 min). `NO_BATTERY_VOLTAGE_THRESHOLD` (the real "nothing plausible connected" floor) lowered from 8V to 2V accordingly. |
 | v1.11.0 | 2026-09-21 | Four additions: (1) a DS18B20 heatsink sensor (OneWire, GPIO2) gives a real runtime over-temperature cutoff (`MAX_HEATSINK_TEMP_C`, 80C default) instead of relying on someone watching the heatsink -- non-blocking (`updateHeatsinkTemp()`), refuses to start without the sensor by default (`REQUIRE_HEATSINK_SENSOR`); (2) a fuse and a reverse-polarity diode in the battery+ lead, hardware-only (schematic updated), with the supply-voltage divider's sense tap relocated to *after* both so the diode's forward drop doesn't skew every reading; (3) Recovery now checks its own progress at `RECOVERY_CHECK_MS` (5 min) and faults early if voltage hasn't risen `RECOVERY_MIN_RISE_V` (0.15V), instead of always waiting the full 30-minute timeout on a battery with a shorted cell; (4) a live divider-calibration mode (hold the button, turn the encoder) tunes `SUPPLY_DIVIDER_RATIO` against a multimeter and saves to NVS without a reflash. Also fixed real overlap bugs in the schematic: the 100R gate-stopper resistors overlapped the MOSFET boxes in all four columns (a 12px encroachment that was there since the diagram's first version), and did a full coordinate re-audit while adding the fuse/diode/DS18B20 to it. |
 | v1.11.1 | 2026-09-21 | Removed the `__has_include(<Adafruit_NeoPixel.h>)` guard entirely -- the library is now a hard, unconditional `#include`. It was letting the sketch silently compile with zero LED code whenever the library wasn't visible to the compiler, with only a boot-time Serial line as a clue; a user had it installed and the LED still didn't work, tracing back to this. A missing library is now a normal compile error instead of a silent no-op. |
+| v1.11.2 | 2026-09-21 | Fixed the status LED's color order: `NEO_RGB` (per Waveshare's docs for the ESP32-C3-Zero) was wrong on the actual hardware -- confirmed by testing, fault showed green instead of red, an exact R/G swap that would have also made DONE show red instead of green. Changed to `NEO_GRB`. |
