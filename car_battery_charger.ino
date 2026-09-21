@@ -759,8 +759,12 @@ void drawBatteryIcon(int x, int y, int w, int h, float fraction) {
 // set to whichever one it used; callers needing a different font
 // afterward (e.g. a small label) must set it themselves.
 void drawBigCentered(const char* text, int maxWidth) {
+  // Baselines leave clearance below the text for a small text line at
+  // y=62 (drawFaultScreen's fault reason) -- 58 put the 32pt font's
+  // glyph body directly on top of it, since a font this tall reaches
+  // ~32px above its own baseline.
   const uint8_t* bigFonts[] = {u8g2_font_logisoso32_tf, u8g2_font_logisoso24_tf, u8g2_font_logisoso16_tf};
-  const int baselineY[] = {58, 50, 40};
+  const int baselineY[] = {48, 42, 34};
   for (uint8_t i = 0; i < 3; i++) {
     u8g2.setFont(bigFonts[i]);
     int w = u8g2.getStrWidth(text);
