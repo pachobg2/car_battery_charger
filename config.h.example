@@ -14,7 +14,7 @@
 // checked, so settings were never actually persisting despite the code
 // looking complete. Keep this at 15 characters or fewer if you rename it.
 static const char* DEVICE_ID        = "cbc1";
-static const char* FIRMWARE_VERSION = "1.10.0";
+static const char* FIRMWARE_VERSION = "1.11.0";
 
 // ------------------------------------------------------------------
 // Hardware -- I2C bus (INA219 current/voltage sensor + SH1106 OLED)
@@ -80,12 +80,23 @@ static const uint16_t INA219_CALIBRATION = 10240;
 // SUPPLY_DIVIDER_RATIO = (110k + 10k) / 10k = 12.0 -- multiply the ADC's
 // calibrated millivolt reading by this to get the actual rail voltage.
 // This is a NOMINAL value from ideal resistor values; real resistors
-// have tolerance, so calibrate it against a multimeter reading on the
-// actual supply rail and adjust this constant until the Serial Monitor's
-// reported supply voltage matches.
+// have tolerance. It's also just the STARTING point now, not the final
+// word: hold the encoder button down and turn the knob (from the normal
+// idle screen) to enter a live calibration mode -- the OLED shows the
+// computed supply voltage updating in real time as you adjust the ratio
+// against a multimeter, click saves it to NVS (see runtimeDividerRatio/
+// saveDividerRatio() in the sketch), long-press cancels. This constant
+// is only the fallback used until a calibration has actually been saved.
 static const int SUPPLY_VOLTAGE_DIVIDER_PIN = 0; // ADC1_CH0
 static const float SUPPLY_DIVIDER_RATIO = 12.0f;
 static const uint8_t SUPPLY_ADC_SAMPLES = 16; // averaged per reading, to quiet ADC noise
+// Calibration mode's per-detent step size and sane bounds -- generous
+// enough to reach a real resistor-tolerance correction (+-5-10% of 12.0
+// covers even fairly loose resistors) without letting a runaway spin
+// set something absurd.
+static const float CALIBRATION_RATIO_STEP = 0.02f;
+static const float CALIBRATION_RATIO_MIN  = 8.0f;
+static const float CALIBRATION_RATIO_MAX  = 16.0f;
 
 // ------------------------------------------------------------------
 // Hardware -- rotary encoder with push button
@@ -119,6 +130,50 @@ static const bool ENCODER_REVERSED = false;
 static const bool STATUS_LED_ENABLED = true;
 static const int STATUS_LED_PIN      = 10;
 static const uint8_t STATUS_LED_BRIGHTNESS = 40; // 0-255, keep low -- it's a status dot, not a room light
+
+// ------------------------------------------------------------------
+// Hardware -- DS18B20 heatsink temperature sensor (OneWire), for a real
+// runtime over-temperature cutoff instead of relying on someone watching
+// the heatsink. Needs an external 4.7k pull-up from the data line to
+// 3V3 (standard OneWire wiring) -- DS18B20 VDD to 3V3, GND to GND.
+//
+// Pin choice: GPIO2, the one strapping pin not already used elsewhere in
+// this design (see the pins table in the README for what's on GPIO0/1/
+// 3-10). Per Espressif's strapping requirements, GPIO2 must read HIGH
+// during reset for either ESP32-C3 boot mode -- the 4.7k pull-up this
+// sensor needs anyway satisfies that passively, since the DS18B20 stays
+// idle/high-Z until the bus is actively addressed well after boot. This
+// is different from GPIO8's situation (the buzzer): that pin has no
+// passive component biasing it one way or the other at all, whereas
+// this one does, deliberately, in the direction that's actually needed.
+static const int DS18B20_PIN = 2;
+
+// Hard cutoff -- faults out (same as any other fault, requires an
+// explicit restart) if the heatsink reaches this temperature while
+// charging. Not a derating curve, just a single threshold, matching the
+// rest of this firmware's safety nets: simple and clearly correct beats
+// a fancier curve that's harder to verify. Mount the DS18B20 thermally
+// bonded to the heatsink (thermal epoxy, or pressed into a drilled hole
+// with thermal paste) as close to the MOSFETs as practical -- a sensor
+// that's only loosely in contact will read low and defeat the point.
+static const float MAX_HEATSINK_TEMP_C = 80.0f;
+// If true (recommended), refuse to start charging at all when the
+// DS18B20 isn't detected/responding -- a fail-safe default, since this
+// is now a real safety net the rest of the design assumes is present.
+// Set false only to deliberately run without it (e.g. bench-testing
+// before the sensor is wired up).
+static const bool REQUIRE_HEATSINK_SENSOR = true;
+// DallasTemperature's requestTemperatures() blocks for the full
+// conversion time by default (~750ms at 12-bit resolution) -- far too
+// long to call from a control loop that runs every 100ms. Firmware uses
+// the library's non-blocking mode instead (setWaitForConversion(false))
+// and polls it itself: HEATSINK_TEMP_POLL_MS is how often a new
+// conversion is started (heatsink thermal mass changes slowly, no need
+// to poll faster), HEATSINK_CONVERSION_MS is how long to wait before
+// reading the result back -- matched to the DS18B20's default 12-bit
+// resolution; lower it if you call setResolution() to something faster.
+static const uint32_t HEATSINK_TEMP_POLL_MS   = 1000UL;
+static const uint32_t HEATSINK_CONVERSION_MS  = 750UL;
 
 // ------------------------------------------------------------------
 // Hardware -- piezo buzzer (passive, driven via the ESP32 core's
@@ -264,6 +319,19 @@ static const uint32_t RECOVERY_TIMEOUT_MS = 30UL * 60 * 1000UL; // 30 min
 // should fault out fast rather than wait for a threshold sized for full
 // bulk current.
 static const float RECOVERY_OVER_CURRENT_FACTOR = 1.5f;
+// Early-exit progress check, evaluated once at RECOVERY_CHECK_MS into a
+// recovery attempt: a battery that's just deeply discharged climbs
+// steadily from the moment current starts flowing, but one with a
+// genuinely shorted cell tends to plateau well below RECOVERY_EXIT_VOLTAGE
+// instead. If voltage hasn't risen at least RECOVERY_MIN_RISE_V by the
+// checkpoint, that's treated as a fault right away instead of waiting out
+// the full RECOVERY_TIMEOUT_MS on an attempt that was never going to
+// succeed. This only ever ends recovery EARLY as a fault -- it can't make
+// a genuinely-recovering battery fail, since a real rise trips this
+// check's "pass" branch and the normal RECOVERY_EXIT_VOLTAGE/
+// RECOVERY_TIMEOUT_MS logic just keeps running as before.
+static const uint32_t RECOVERY_CHECK_MS = 5UL * 60 * 1000UL; // 5 min
+static const float RECOVERY_MIN_RISE_V = 0.15f;
 
 // Bulk-stage current as a fraction of capacity for "easy mode" (0.1 = C/10,
 // a conservative slow-charge rate safe for old/unknown-condition batteries).

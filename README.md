@@ -1,10 +1,12 @@
 # Car Battery Charger — ESP32-C3-Zero smart lead-acid charger
 
-Standalone smart charger for flooded/AGM 12V car batteries (44-100Ah).
-No WiFi/MQTT/cloud/OTA — everything is local: an INA219 current sensor,
-a second ADC-based supply-voltage sense, a SH1106 128x64 OLED, a rotary
-encoder with push button, and a piezo buzzer are the entire interface.
-Re-flashing always needs a USB cable.
+Standalone smart charger for flooded/AGM 12V-100Ah down to small 3Ah SLA
+batteries. No WiFi/MQTT/cloud/OTA — everything is local: an INA219
+current sensor, a second ADC-based supply-voltage sense, a DS18B20
+heatsink temperature sensor, a SH1106 128x64 OLED, a rotary encoder with
+push button, and a piezo buzzer are the entire interface. A fuse and a
+reverse-polarity diode protect the battery leads. Re-flashing always
+needs a USB cable.
 
 **Read the Hardware section below before wiring this up.** This design
 regulates charge current by running a bank of 4 parallel IRL540N MOSFETs
@@ -28,6 +30,8 @@ battery voltage directly.
 2. **Libraries** (Library Manager):
    - `Adafruit INA219` by Adafruit
    - `U8g2` by olikraus
+   - `OneWire` by Paul Stoffregen and `DallasTemperature` by Miles
+     Burton -- for the DS18B20 heatsink sensor
    - `Adafruit NeoPixel` by Adafruit (needed if `STATUS_LED_ENABLED` is
      `true`, the default -- **if you skip this, the status LED silently
      does nothing.** `__has_include()` compiles the whole NeoPixel code
@@ -60,15 +64,28 @@ There's no OTA in this build — flash over USB every time.
 | Supply-rail voltage divider | GPIO0 | ADC1_CH0, see Voltage sensing below |
 | Status LED (onboard WS2812) | GPIO10 | matches `smart_switch`'s convention |
 | Piezo buzzer | GPIO8 | see note below — this is a strapping pin |
+| DS18B20 heatsink sensor | GPIO2 | OneWire, see note below — also a strapping pin |
 
-Every non-strapping GPIO is already spoken for above, so the buzzer
-defaults to GPIO8 — a strapping pin, but one only sampled at boot/reset;
-this sketch never drives it until well after boot, and a bare piezo (no
-extra pull resistor of your own) shouldn't disturb that sampling. Verify
-your specific board doesn't already use GPIO8 for something else first
-(a few ESP32-C3 dev boards put a second onboard LED there) — GPIO2 is
-the fallback if so. Avoid GPIO9 for anything external — it's the BOOT
-button on most of these boards.
+Every non-strapping GPIO is already spoken for above, so both the buzzer
+and the DS18B20 land on the two remaining strapping pins (GPIO9, the
+third one, is the BOOT button on most of these boards — avoid it for
+anything external):
+
+- **GPIO8 (buzzer)**: only sampled at boot/reset; this sketch never
+  drives it until well after boot, and a bare piezo (no extra pull
+  resistor of your own) shouldn't disturb that sampling. Verify your
+  specific board doesn't already use GPIO8 for something else first (a
+  few ESP32-C3 dev boards put a second onboard LED there).
+- **GPIO2 (DS18B20)**: needs to read HIGH during reset for either
+  ESP32-C3 boot mode. The 4.7k OneWire pull-up this sensor requires
+  anyway satisfies that passively, since the DS18B20 stays idle/high-Z
+  until the bus is actively addressed, well after boot — a genuinely
+  safe choice here, not just "probably fine."
+
+If your board already uses one of these for something else, you're out
+of non-strapping options and will need to free one up (e.g. drop the
+status LED, or move the buzzer to an NPN-driven arrangement that doesn't
+need a GPIO pull consideration) rather than finding a third spare pin.
 
 ### Voltage sensing — read this before wiring, it changes the topology
 
@@ -94,13 +111,49 @@ battery_voltage = supply_rail_measured − ina219_bus_reading
 Both terms are ground-referenced, so this stays accurate even if the 26V
 supply sags under load or isn't exactly 26V — which mattered enough to
 fix, since the charge algorithm's thresholds are 0.2V apart (14.4V vs
-14.6V). `SUPPLY_DIVIDER_RATIO` in `config.h` (12.0 nominal) should be
-calibrated against a multimeter reading on the real supply rail; the
-Serial Monitor prints the measured rail voltage at boot.
+14.6V). `SUPPLY_DIVIDER_RATIO` in `config.h` (12.0 nominal) is only the
+starting point now — see "Live divider calibration" below for tuning it
+without a reflash; the Serial Monitor also prints the measured rail
+voltage at boot either way.
 
 The INA219 itself is used **only for current sensing** now (via its
 shunt, using the custom calibration described below) — its bus-voltage
 feature plays no role in the charge algorithm.
+
+**The divider taps `BATT+` after the fuse and reverse-polarity diode**
+(see "Fuse and reverse-polarity protection" below), at the true battery
+terminal — not at the raw supply/fuse node before them. Tapping before
+the diode would bake its ~0.3–0.5V forward drop into every reading,
+right where the charge algorithm's thresholds are already only 0.2V
+apart.
+
+### Fuse and reverse-polarity protection
+
+Two things that weren't in earlier versions of this design, both cheap
+insurance against real failure modes:
+
+- **A 15A fast-blow fuse in series with the battery+ lead**, as close to
+  the battery as practical. Nothing in this design otherwise limits
+  current if a MOSFET fails shorted — that would dump the full 26V
+  supply (minus whatever the battery itself drops) straight through
+  whatever's in the way, limited only by wiring resistance. Size it to
+  your actual build's current, not just the 10A ceiling this firmware
+  defaults to.
+- **A series Schottky diode (D1) in the battery+ lead**, anode toward
+  the supply, cathode toward the battery. Connecting the battery
+  backwards would otherwise let charging current flow straight through
+  the MOSFET bank's own body diodes — regardless of gate state, since
+  body diodes conduct independent of what the gate is doing — turning a
+  simple wiring mistake into an uncontrolled short. A plain series diode
+  blocks that unconditionally, in either direction, regardless of this
+  design's topology; that's deliberately simpler than a P-channel MOSFET
+  reverse-protection circuit, which would need to be re-derived carefully
+  for this specific low-side-MOSFET layout to get the gate bias direction
+  right. Size the diode for your real max current, not just a token
+  rating — a 1N5822 (3A) is nowhere near enough for a 10A charger; look
+  for something rated at least 1.5x your actual ceiling, in a package
+  you can heatsink (it will dissipate real power: `0.3–0.5V × current`,
+  the same physics as the reverse-polarity diode in any other design).
 
 ### MOSFET bank — 4x IRL540N in parallel, current-shared
 
@@ -151,13 +204,13 @@ and dissipates ~1.4W (use 5W resistors for margin). Matched MOSFETs from
 the same batch help too — less imbalance for the ballast resistors to
 correct.
 
-Power path: 26V DC supply → battery+ → battery− → the four MOSFET
-drains (paralleled) → each MOSFET's own ballast resistor → common
-return → the 0.01Ω/25W main current shunt → supply/system ground. The
-INA219's VIN+/VIN− sense directly across that main shunt's two leads
-(Kelvin-style — wire the sense leads to the resistor's own terminals,
-not through the high-current power lugs, or shunt-lead resistance will
-skew the reading).
+Power path: 26V DC supply → fuse → reverse-polarity diode → battery+ →
+battery− → the four MOSFET drains (paralleled) → each MOSFET's own
+ballast resistor → common return → the 0.01Ω/25W main current shunt →
+supply/system ground. The INA219's VIN+/VIN− sense directly across that
+main shunt's two leads (Kelvin-style — wire the sense leads to the
+resistor's own terminals, not through the high-current power lugs, or
+shunt-lead resistance will skew the reading).
 
 ### Thermal warning — read this even if you skip everything else
 
@@ -171,12 +224,42 @@ start of a bulk charge (exactly when easy-mode picks the highest
 current). 36W per TO-220 is realistic on a real heatsink with airflow,
 but it's not casual — this is not a "bolt on any old heatsink" build.
 
-The firmware has **no thermal sensor** on the MOSFETs and cannot detect
-overheating. Watch case temperature by hand (or an IR thermometer) on
-first use anywhere near the current ceiling, and back `MAX_CHARGE_CURRENT_A`
-off — or add more parallel MOSFETs — if it's climbing past what your
-cooling holds in steady state. If you build with fewer than 4 MOSFETs,
-lower `MAX_CHARGE_CURRENT_A` proportionally in `config.h`.
+A DS18B20 now gives a real cutoff (see below) rather than nothing at
+all, but that's a backstop, not a design target — watch case temperature
+by hand (or an IR thermometer) on first use anywhere near the current
+ceiling, and back `MAX_CHARGE_CURRENT_A` off — or add more parallel
+MOSFETs — if it's climbing toward the cutoff in normal use. If you build
+with fewer than 4 MOSFETs, lower `MAX_CHARGE_CURRENT_A` proportionally
+in `config.h`.
+
+### Heatsink over-temperature cutoff (DS18B20)
+
+A DS18B20 (OneWire, GPIO2) thermally bonded to the heatsink gives an
+actual runtime safety net instead of relying on someone watching it:
+charging faults out immediately if the heatsink reaches
+`MAX_HEATSINK_TEMP_C` (80°C default) — same as any other fault, requires
+an explicit restart. **Mount it so it actually reads the heatsink's
+temperature** — thermal epoxy, or pressed into a drilled hole with
+thermal paste, as close to the MOSFETs as practical. A sensor just
+zip-tied nearby with no real thermal contact will read low and defeat
+the entire point of having it.
+
+By default (`REQUIRE_HEATSINK_SENSOR = true`), the firmware refuses to
+start charging at all if the DS18B20 isn't detected — a fail-safe
+default, since this is now a safety net the rest of the design assumes
+is present. Set it `false` only to deliberately run without the sensor
+(e.g. bench-testing before it's wired up); the Serial Monitor logs how
+many OneWire devices it found at boot either way.
+
+`DallasTemperature`'s normal `requestTemperatures()` call blocks for the
+conversion time (~750ms at default 12-bit resolution) — unacceptable in
+a control loop that runs every 100ms. The firmware uses the library's
+non-blocking mode instead and polls it itself (`updateHeatsinkTemp()`,
+`HEATSINK_TEMP_POLL_MS`/`HEATSINK_CONVERSION_MS`), reading roughly once
+a second — heatsink thermal mass changes slowly, there's no benefit to
+polling faster, and there's no reason to accept a 750ms stall in a
+safety-relevant control loop when a non-blocking read is this
+straightforward.
 
 ### INA219 custom calibration (0.01Ω / 25W shunt, up to ~10A)
 
@@ -242,6 +325,16 @@ Stages for flooded/AGM lead-acid, no continuous float:
    recovering past `RECOVERY_EXIT_VOLTAGE` (10V default); if it never
    does within `RECOVERY_TIMEOUT_MS` (30 min default), that's a real
    fault — likely a bad battery — not something to keep trying past.
+   It also checks its own progress early: at `RECOVERY_CHECK_MS` (5 min
+   default) in, if voltage hasn't risen at least `RECOVERY_MIN_RISE_V`
+   (0.15V default) from where it started, that's treated as a fault right
+   away instead of waiting out the full timeout. A battery that's
+   genuinely just flat climbs steadily from the moment current starts
+   flowing; one with a shorted cell tends to plateau well below
+   `RECOVERY_EXIT_VOLTAGE` instead — this catches that difference in
+   minutes instead of half an hour. It can only end recovery *early* as a
+   fault; a real rise just passes the check and the normal
+   exit-voltage/timeout logic keeps running as before.
 1. **Bulk** — constant current at the selected target, until the battery
    reaches `BULK_TARGET_VOLTAGE` (14.4V default).
 2. **Absorption** — constant voltage (`ABSORPTION_VOLTAGE`, 14.6V
@@ -255,7 +348,8 @@ Stages for flooded/AGM lead-acid, no continuous float:
 Safety nets that run independently of the control loop: hard
 over-voltage cutoff (15V), hard over-current fault (125% of the current
 limit, sustained — tighter during Recovery, 150% of the much lower
-recovery current), an absolute 14h max-duration timeout (covering the
+recovery current), a heatsink over-temperature cutoff (DS18B20, see
+Hardware above), an absolute 14h max-duration timeout (covering the
 whole session, recovery included), and a "no battery detected" refusal
 to start if the resting voltage isn't plausible at all (below 2V — a
 genuinely open circuit or disconnected battery reads close to 0V; this
@@ -311,6 +405,9 @@ overlay" below).
   returns to idle. Rotation and long-press are ignored while active —
   stop first to change settings.
 - **Done / Fault**: click acknowledges and returns to idle.
+- **Idle, hold the button down and turn the knob**: enters divider
+  calibration mode — see "Live divider calibration" below. A deliberate
+  two-handed gesture, distinct from a plain long-press.
 
 The onboard status LED (if present/enabled) mirrors state at a glance:
 blue = idle, magenta = recovery, yellow = bulk, orange = absorption,
@@ -338,14 +435,32 @@ persisted — a fresh boot always comes up `Idle` regardless of what was
 happening before, and starting a charge always requires an explicit
 click. See "Charge algorithm" above for why.
 
+### Live divider calibration
+
+Hold the encoder button down and turn the knob (from the normal idle
+screen) to enter a dedicated calibration screen for
+`SUPPLY_DIVIDER_RATIO` — no reflash needed. It shows the computed supply
+voltage updating live as you rotate to adjust the ratio; compare it
+against a multimeter on the actual supply rail and dial it in. Click
+saves the new ratio to NVS (`saveDividerRatio()`, its own NVS key,
+separate from `savePersistedSettings()` so it can't be accidentally
+overwritten by ordinary mode/current changes); long-press cancels and
+leaves the previous value in place. `runtimeDividerRatio` — not the
+compiled `SUPPLY_DIVIDER_RATIO` constant directly — is what
+`readSupplyVoltage()` actually uses, falling back to the compiled
+constant until a calibration has been saved at least once.
+
 ## Display
 
 The normal status screen is four bands, top to bottom: state name
 (bold) with a capacity/manual badge on the right; a battery icon with
 SoC% and a small dot that only appears while actively charging; a big
 voltage/current readout; and a context line (ETA during bulk, "Topping
-off..." during absorption, the fault reason, or the target current
-while idle).
+off..." during absorption, time remaining during Recovery, or the
+target current while idle) — with the heatsink temperature appended
+when the DS18B20's working, truncated off gracefully by `drawStrFit()`
+rather than crowding out the more important part of the line if it
+doesn't fit.
 
 That bottom line — and the fault reason, which is also free-form text —
 is drawn through `drawStrFit()`, which measures the string in the
@@ -381,6 +496,15 @@ Text that's too long for a 128px-wide display isn't a hypothetical: a
 fixed-length assumption is exactly what let `"(click=start)"` and a
 couple of the longer fault-reason strings get cut off mid-word before.
 
+### Divider calibration screen
+
+Entered by holding the button and turning the encoder (see "Live
+divider calibration" above) — also takes over the whole display, same
+`drawBigCentered()` helper as the fault screen (same raised baselines,
+since this screen has its own fixed hint line at the bottom too): a
+label, the live computed supply voltage in the biggest font that fits,
+and a hint line for the controls.
+
 ## Tuning the control loop
 
 Open the Serial Monitor at 115200 baud while charging — the control loop
@@ -401,16 +525,25 @@ alongside the existing control loop.
 
 I cross-checked the `Adafruit_INA219` and `U8g2` API calls used here
 against their published APIs, the INA219 custom-calibration register
-writes against the INA219 datasheet's calibration procedure, and the
-control-loop/state-machine logic against standard 3-stage lead-acid
-charging practice. I could not compile this sketch or run it on real
-hardware in the sandbox that generated it — no ESP32 toolchain or
-physical charger available there. Before trusting this on an actual
-battery: build it, watch the Serial Monitor through a full
+writes against the INA219 datasheet's calibration procedure, the
+`DallasTemperature` non-blocking API (`setWaitForConversion(false)`,
+`getTempCByIndex()`, `DEVICE_DISCONNECTED_C`) against its published
+docs, and the control-loop/state-machine logic against standard
+3-stage lead-acid charging practice. I could not compile this sketch or
+run it on real hardware in the sandbox that generated it — no ESP32
+toolchain or physical charger available there. Before trusting this on
+an actual battery: build it, watch the Serial Monitor through a full
 bulk→absorption→done cycle, and separately verify with a multimeter (and
 a known-accurate ammeter, given the custom shunt) that measured
 voltage/current match the OLED and Serial readings before leaving it
 unattended.
+
+The fuse and reverse-polarity diode ratings (15A, and "at least 1.5x
+your real current" for the diode) are reasonable starting points, not a
+substitute for checking them against your own actual build's current
+and wire gauge — I don't know your exact wiring run or connector
+ratings, so size both against your own numbers, not just what's written
+here.
 
 **The Recovery stage is the most safety-relevant thing in this
 firmware and I could not test it on a real damaged battery.** The logic
@@ -457,3 +590,4 @@ for the closest available size in that family and swap it into the
 | v1.9.1 | 2026-09-21 | Fixed the fault screen's big "FAULT" text overlapping the reason text below it -- the 32pt font's baseline (58) put its glyph body directly on top of the fixed reason line at y=62, since a font that tall reaches ~32px above its own baseline. Raised all three `drawBigCentered()` baselines (48/42/34) for proper clearance. |
 | v1.9.2 | 2026-09-21 | v1.9.1 raised the shared baseline table, which regressed the capacity/current overlay's positioning too -- it never had an overlap problem, only the fault screen did. `drawBigCentered()` now takes its baseline array as a parameter instead of a hardcoded shared one; the overlay keeps its original {58,50,40}, the fault screen keeps the raised {48,42,34}. |
 | v1.10.0 | 2026-09-21 | Added 3/5/10Ah to the capacity presets (small SLA batteries, not just full-size car batteries) -- `DEFAULT_CAPACITY_PRESET_INDEX` shifted from 3 to 6 to keep pointing at 60Ah. Added a new Recovery stage (`STATE_RECOVERY`) for batteries resting below `RECOVERY_ENTRY_VOLTAGE_THRESHOLD` (8V default) -- previously refused outright as "no battery detected"; now attempts a cautious, much lower current first (since a shorted cell can read in this same range, and full bulk current into a short is how a battery ruptures), graduating to Bulk once it recovers past `RECOVERY_EXIT_VOLTAGE` (10V) or faulting as unresponsive after `RECOVERY_TIMEOUT_MS` (30 min). `NO_BATTERY_VOLTAGE_THRESHOLD` (the real "nothing plausible connected" floor) lowered from 8V to 2V accordingly. |
+| v1.11.0 | 2026-09-21 | Four additions: (1) a DS18B20 heatsink sensor (OneWire, GPIO2) gives a real runtime over-temperature cutoff (`MAX_HEATSINK_TEMP_C`, 80C default) instead of relying on someone watching the heatsink -- non-blocking (`updateHeatsinkTemp()`), refuses to start without the sensor by default (`REQUIRE_HEATSINK_SENSOR`); (2) a fuse and a reverse-polarity diode in the battery+ lead, hardware-only (schematic updated), with the supply-voltage divider's sense tap relocated to *after* both so the diode's forward drop doesn't skew every reading; (3) Recovery now checks its own progress at `RECOVERY_CHECK_MS` (5 min) and faults early if voltage hasn't risen `RECOVERY_MIN_RISE_V` (0.15V), instead of always waiting the full 30-minute timeout on a battery with a shorted cell; (4) a live divider-calibration mode (hold the button, turn the encoder) tunes `SUPPLY_DIVIDER_RATIO` against a multimeter and saves to NVS without a reflash. Also fixed real overlap bugs in the schematic: the 100R gate-stopper resistors overlapped the MOSFET boxes in all four columns (a 12px encroachment that was there since the diagram's first version), and did a full coordinate re-audit while adding the fuse/diode/DS18B20 to it. |

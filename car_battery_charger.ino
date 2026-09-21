@@ -26,6 +26,13 @@
  *     config.h.example for why). See config.h.example for the full gate
  *     drive schematic and an important thermal warning either way: this
  *     bank dissipates real, continuous heat and needs proper heatsinking.
+ *   - A DS18B20 (OneWire, GPIO2) thermally bonded to the MOSFET heatsink
+ *     for an actual runtime over-temperature cutoff -- MAX_HEATSINK_TEMP_C
+ *     in config.h.example -- rather than relying on someone watching it.
+ *     GPIO2 needs to read HIGH during reset for either ESP32-C3 boot mode
+ *     (a strapping-pin requirement); OneWire's own external 4.7k pull-up
+ *     to 3V3 satisfies that passively, since the DS18B20 stays idle/high-Z
+ *     until the bus is actively addressed -- see config.h.example.
  *
  * Standalone device -- no WiFi/MQTT/Home Assistant/OTA. Everything is
  * local: the OLED + rotary encoder are the only interface. Re-flashing
@@ -51,11 +58,19 @@
  *         requires an explicit click.
  * Safety nets independent of the control loop: hard over-voltage cutoff,
  * hard over-current fault (plus a tighter one specific to the recovery
- * stage), absolute max charge duration, and a "no battery detected"
- * refusal to start if the sensed voltage isn't plausible at all (a much
- * lower bar than the recovery threshold -- see NO_BATTERY_VOLTAGE_THRESHOLD
- * in config.h.example). Charging never auto-resumes after a reboot/power
+ * stage), a heatsink over-temperature cutoff (DS18B20), absolute max
+ * charge duration, and a "no battery detected" refusal to start if the
+ * sensed voltage isn't plausible at all (a much lower bar than the
+ * recovery threshold -- see NO_BATTERY_VOLTAGE_THRESHOLD in
+ * config.h.example). Charging never auto-resumes after a reboot/power
  * loss -- always requires a fresh explicit start.
+ *
+ * Recovery also checks its own progress partway through
+ * (RECOVERY_CHECK_MS/RECOVERY_MIN_RISE_V): a battery with a genuinely
+ * shorted cell tends to plateau rather than climb, so a real fault is
+ * raised well before the full RECOVERY_TIMEOUT_MS if the voltage hasn't
+ * risen a plausible amount by the checkpoint, instead of waiting out the
+ * whole timeout on a battery that was never going to recover.
  *
  * Local UI: rotating the encoder while idle adjusts the live value --
  * manual target current, or the capacity preset (from config.h's
@@ -66,6 +81,12 @@
  * toggles between manual and easy mode, showing the same readout
  * briefly. Click still just starts/stops/acknowledges, unchanged by any
  * of this.
+ *
+ * Holding the button while ALSO turning the encoder (a deliberate two-
+ * handed gesture, distinct from a plain long-press) enters a calibration
+ * mode for SUPPLY_DIVIDER_RATIO: the OLED shows the live computed supply
+ * voltage as you adjust the ratio against a multimeter reading, click
+ * saves it to NVS, long-press cancels. See enterCalibrationMode() below.
  *
  * A piezo buzzer (BUZZER_PIN, driven via tone()/noTone()) plays a short
  * non-blocking tone pattern on every charge state transition: a rising
@@ -78,6 +99,8 @@
  *   - Adafruit INA219 (adafruit) -- only used for begin()/getBusVoltage_V();
  *     current is read via a custom register write/read, see below.
  *   - U8g2 (olikraus)
+ *   - OneWire (Paul Stoffregen) and DallasTemperature (Miles Burton) --
+ *     for the DS18B20 heatsink sensor
  *   - Adafruit NeoPixel (adafruit) -- only if STATUS_LED_ENABLED
  *   Built-in / come with the ESP32 Arduino core: Preferences, Wire
  *
@@ -88,9 +111,12 @@
 
 #include <Preferences.h>
 #include <esp_system.h>
+#include <math.h>
 #include <Wire.h>
 #include <Adafruit_INA219.h>
 #include <U8g2lib.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 #if __has_include(<Adafruit_NeoPixel.h>)
 #include <Adafruit_NeoPixel.h>
 #endif
@@ -126,9 +152,13 @@ U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /*reset=*/U8X8_PIN_NONE);
 // GRB. Wrong order gives wrong colors, not a dead LED, but it's wrong.
 Adafruit_NeoPixel statusLed(1, STATUS_LED_PIN, NEO_RGB + NEO_KHZ800);
 #endif
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature heatsinkTempSensor(&oneWire);
 
 ChargeState chargeState = STATE_IDLE;
 String faultReason = "";
+float heatsinkTempC = NAN;        // NAN until the first successful reading
+bool heatsinkSensorOk = false;
 
 bool useEasyMode = false;
 uint8_t capacityPresetIndex = DEFAULT_CAPACITY_PRESET_INDEX;
@@ -163,6 +193,8 @@ unsigned long overCurrentFaultSinceMs = 0; // 0 = not currently over
 float recoveryCurrentA = 0.0f;             // computed fresh at the start of each recovery attempt
 unsigned long recoveryStartMs = 0;
 unsigned long recoveryOverCurrentSinceMs = 0; // 0 = not currently over -- tighter than the general over-current check
+float recoveryStartVoltage = 0.0f; // OCV captured when recovery began, for the progress check below
+bool recoveryProgressChecked = false; // one-shot -- only evaluated once, at RECOVERY_CHECK_MS
 
 uint16_t gateDuty = 0;          // current commanded duty, 0..GATE_PWM_MAX_DUTY
 bool softStarting = false;
@@ -185,6 +217,20 @@ bool buttonStable = false;
 unsigned long buttonLastChangeMs = 0;
 bool buttonLongPressFired = false;
 unsigned long buttonPressStartMs = 0;
+
+// Supply-divider calibration mode -- entered by holding the button while
+// ALSO turning the encoder (see handleEncoderAndButton()), a deliberate
+// two-handed gesture distinct from a plain long-press. Lets
+// SUPPLY_DIVIDER_RATIO be tuned against a multimeter reading without a
+// recompile; see enterCalibrationMode()/updateCalibrationScreen().
+bool inCalibrationMode = false;
+float calibrationRatio = 0.0f; // working value while adjusting, saved to NVS on confirm
+
+// Runtime-adjustable supply divider ratio, loaded from NVS (falling back
+// to the compiled SUPPLY_DIVIDER_RATIO if never calibrated) -- this is
+// what readSupplyVoltage() actually uses, not the compile-time constant
+// directly, so calibration survives without a reflash.
+float runtimeDividerRatio = SUPPLY_DIVIDER_RATIO;
 
 // Buzzer state (non-blocking tone sequencer -- see updateBuzzer())
 const uint16_t* activeBeepFreqs = nullptr;
@@ -212,6 +258,7 @@ void applyGateDuty(uint16_t duty);
 float estimateSocFromOcv(float v);
 void loadPersistedSettings();
 void savePersistedSettings();
+void saveDividerRatio();
 void setStatusLed(uint8_t r, uint8_t g, uint8_t b);
 void ina219WriteCalibration(uint16_t calValue);
 int16_t ina219ReadRawCurrent();
@@ -220,6 +267,10 @@ void startBeepPattern(const uint16_t* freqs, const uint16_t* durs, uint8_t len);
 void updateBuzzer();
 float readSupplyVoltage();
 float readBatteryVoltage();
+void updateHeatsinkTemp();
+void enterCalibrationMode();
+void exitCalibrationMode(bool save);
+void updateCalibrationScreen();
 
 // ------------------------------------------------------------------
 // Helpers
@@ -361,13 +412,18 @@ float readIna219CurrentA() {
 // analogReadMilliVolts() uses the ESP32's factory ADC calibration --
 // meaningfully more accurate than assuming a fixed 3.3V/4095 scale.
 // ------------------------------------------------------------------
+// Uses runtimeDividerRatio (NVS-backed, see loadPersistedSettings()),
+// not the compiled SUPPLY_DIVIDER_RATIO constant directly -- lets
+// enterCalibrationMode() tune this against a multimeter without a
+// reflash. runtimeDividerRatio defaults to the compiled constant until
+// a calibration is actually saved.
 float readSupplyVoltage() {
   uint32_t sumMv = 0;
   for (uint8_t i = 0; i < SUPPLY_ADC_SAMPLES; i++) {
     sumMv += analogReadMilliVolts(SUPPLY_VOLTAGE_DIVIDER_PIN);
   }
   float avgV = (sumMv / (float)SUPPLY_ADC_SAMPLES) / 1000.0f;
-  return avgV * SUPPLY_DIVIDER_RATIO;
+  return avgV * runtimeDividerRatio;
 }
 
 // True battery terminal voltage -- see readSupplyVoltage()'s comment.
@@ -375,6 +431,50 @@ float readBatteryVoltage() {
   float supplyV = readSupplyVoltage();
   float returnRailV = ina219.getBusVoltage_V();
   return supplyV - returnRailV;
+}
+
+// Heatsink temperature (DS18B20, OneWire). Returns NAN on read failure
+// (sensor disconnected, no response, bad CRC) rather than a stale or
+// zero value that could be mistaken for a real reading -- callers must
+// check isnan() before using it, exactly like they'd need to for any
+// safety-relevant sensor that can simply not be there.
+// Non-blocking. DallasTemperature's requestTemperatures() blocks for the
+// full conversion time by default (~750ms at the default 12-bit
+// resolution) -- unacceptable called from a control loop that runs
+// every 100ms. setWaitForConversion(false) (set once in setup()) makes
+// it return immediately instead; this function tracks the conversion
+// timing itself, polling roughly once a second (heatsink thermal mass
+// changes slowly -- there's no benefit to reading faster) and only
+// actually fetching a result once the conversion is actually done,
+// updating the global heatsinkTempC/heatsinkSensorOk either way. Called
+// every loop() iteration; cheap when there's nothing to do.
+void updateHeatsinkTemp() {
+  static bool converting = false;
+  static unsigned long conversionStartMs = 0;
+  static unsigned long lastRequestMs = 0;
+  unsigned long now = millis();
+
+  if (!converting) {
+    if (now - lastRequestMs >= HEATSINK_TEMP_POLL_MS) {
+      heatsinkTempSensor.requestTemperatures(); // returns immediately -- conversion runs in the background
+      conversionStartMs = now;
+      lastRequestMs = now;
+      converting = true;
+    }
+    return;
+  }
+
+  if (now - conversionStartMs >= HEATSINK_CONVERSION_MS) {
+    float t = heatsinkTempSensor.getTempCByIndex(0);
+    if (t == DEVICE_DISCONNECTED_C) {
+      heatsinkSensorOk = false;
+      heatsinkTempC = NAN;
+    } else {
+      heatsinkSensorOk = true;
+      heatsinkTempC = t;
+    }
+    converting = false;
+  }
 }
 
 // ------------------------------------------------------------------
@@ -398,9 +498,10 @@ void loadPersistedSettings() {
   capacityPresetIndex = prefs.getUChar("capIdx", DEFAULT_CAPACITY_PRESET_INDEX);
   if (capacityPresetIndex >= CAPACITY_PRESETS_COUNT) capacityPresetIndex = DEFAULT_CAPACITY_PRESET_INDEX;
   targetCurrentA = prefs.getFloat("targetA", DEFAULT_MANUAL_CURRENT_A);
+  runtimeDividerRatio = prefs.getFloat("divRatio", SUPPLY_DIVIDER_RATIO);
   prefs.end();
-  Serial.printf("[nvs] loaded: %s mode, capacity index %u, target %.2fA\n",
-                useEasyMode ? "easy" : "manual", capacityPresetIndex, targetCurrentA);
+  Serial.printf("[nvs] loaded: %s mode, capacity index %u, target %.2fA, divider ratio %.3f\n",
+                useEasyMode ? "easy" : "manual", capacityPresetIndex, targetCurrentA, runtimeDividerRatio);
 
   if (useEasyMode) {
     selectedCapacityAh = CAPACITY_PRESETS_AH[capacityPresetIndex];
@@ -422,6 +523,20 @@ void savePersistedSettings() {
   prefs.end();
 }
 
+// Separate from savePersistedSettings() -- this is only ever written from
+// enterCalibrationMode()'s confirm action, not on every ordinary
+// mode/current change, so it can't be accidentally overwritten by ordinary
+// use.
+void saveDividerRatio() {
+  if (!prefs.begin(DEVICE_ID, /*readOnly=*/false)) {
+    Serial.println("[nvs] FAILED to open Preferences namespace -- divider ratio will not persist");
+    return;
+  }
+  prefs.putFloat("divRatio", runtimeDividerRatio);
+  prefs.end();
+  Serial.printf("[nvs] saved divider ratio: %.3f\n", runtimeDividerRatio);
+}
+
 // ------------------------------------------------------------------
 // MOSFET gate drive
 // ------------------------------------------------------------------
@@ -436,6 +551,15 @@ void applyGateDuty(uint16_t duty) {
 // ------------------------------------------------------------------
 void startCharging() {
   if (chargeState == STATE_RECOVERY || chargeState == STATE_BULK || chargeState == STATE_ABSORPTION) return;
+
+  if (REQUIRE_HEATSINK_SENSOR && !heatsinkSensorOk) {
+    faultReason = "Heatsink sensor not detected";
+    chargeState = STATE_FAULT;
+    updateStatusLedForState();
+    startBeepPattern(BUZZER_FAULT_FREQ_HZ, BUZZER_FAULT_DUR_MS, BEEP_LEN(BUZZER_FAULT_FREQ_HZ));
+    Serial.println("[charge] refusing to start: DS18B20 not detected (REQUIRE_HEATSINK_SENSOR)");
+    return;
+  }
 
   // Take one reading with the MOSFET still off to sanity-check that a
   // battery is actually connected, and to seed the SoC estimate from its
@@ -477,6 +601,8 @@ void startCharging() {
         ? constrain(selectedCapacityAh * RECOVERY_CURRENT_FRACTION_OF_CAPACITY, MANUAL_CURRENT_MIN_A, MAX_CHARGE_CURRENT_A)
         : constrain(RECOVERY_DEFAULT_CURRENT_A, MANUAL_CURRENT_MIN_A, MAX_CHARGE_CURRENT_A);
     recoveryStartMs = chargeStartMs;
+    recoveryStartVoltage = ocv;
+    recoveryProgressChecked = false;
     chargeState = STATE_RECOVERY;
     Serial.printf("[charge] START recovery, current=%.2fA ocv=%.2fV (below %.1fV recovery threshold)\n",
                   recoveryCurrentA, ocv, RECOVERY_ENTRY_VOLTAGE_THRESHOLD);
@@ -492,6 +618,26 @@ void startCharging() {
 
   updateStatusLedForState();
   startBeepPattern(BUZZER_START_FREQ_HZ, BUZZER_START_DUR_MS, BEEP_LEN(BUZZER_START_FREQ_HZ));
+}
+
+// ------------------------------------------------------------------
+// Supply-divider calibration mode -- see the interaction-model comment
+// on handleEncoderAndButton() for how this is entered (hold + turn).
+// ------------------------------------------------------------------
+void enterCalibrationMode() {
+  inCalibrationMode = true;
+  calibrationRatio = runtimeDividerRatio;
+  Serial.printf("[cal] entering divider calibration, starting ratio=%.3f\n", calibrationRatio);
+}
+
+void exitCalibrationMode(bool save) {
+  if (save) {
+    runtimeDividerRatio = calibrationRatio;
+    saveDividerRatio();
+  } else {
+    Serial.printf("[cal] cancelled, ratio unchanged (%.3f)\n", runtimeDividerRatio);
+  }
+  inCalibrationMode = false;
 }
 
 void stopCharging(ChargeState endState, const String &reason) {
@@ -532,6 +678,23 @@ void controlLoop() {
   if (now - chargeStartMs >= MAX_CHARGE_DURATION_MS) {
     stopCharging(STATE_FAULT, "Max charge duration exceeded");
     return;
+  }
+  if (heatsinkSensorOk && heatsinkTempC >= MAX_HEATSINK_TEMP_C) {
+    char tempFaultMsg[32];
+    snprintf(tempFaultMsg, sizeof(tempFaultMsg), "Heatsink over-temp (%.0fC)", heatsinkTempC);
+    stopCharging(STATE_FAULT, tempFaultMsg);
+    return;
+  }
+  if (chargeState == STATE_RECOVERY && !recoveryProgressChecked && (now - recoveryStartMs) >= RECOVERY_CHECK_MS) {
+    recoveryProgressChecked = true;
+    if (busVoltage - recoveryStartVoltage < RECOVERY_MIN_RISE_V) {
+      // A battery that's just flat climbs steadily; one that plateaus
+      // this early usually has a shorted cell and was never going to
+      // reach RECOVERY_EXIT_VOLTAGE. Faulting out now instead of waiting
+      // the full RECOVERY_TIMEOUT_MS catches that much sooner.
+      stopCharging(STATE_FAULT, "Recovery stalled -- possible shorted cell");
+      return;
+    }
   }
   if (chargeState == STATE_RECOVERY && busCurrent >= recoveryCurrentA * RECOVERY_OVER_CURRENT_FACTOR) {
     // Tighter than the general over-current check below -- recovery
@@ -635,9 +798,10 @@ void controlLoop() {
   static unsigned long lastControlLogMs = 0;
   if (now - lastControlLogMs >= 1000) {
     lastControlLogMs = now;
-    Serial.printf("[ctrl] state=%s V=%.2f I=%.2f target=%.2fA duty=%u/%u soc=%.0f%%\n",
+    Serial.printf("[ctrl] state=%s V=%.2f I=%.2f target=%.2fA duty=%u/%u soc=%.0f%% heatsink=%s\n",
                   chargeStateName(chargeState), busVoltage, busCurrent, targetCurrentA,
-                  gateDuty, GATE_PWM_MAX_DUTY, socFraction * 100.0f);
+                  gateDuty, GATE_PWM_MAX_DUTY, socFraction * 100.0f,
+                  heatsinkSensorOk ? String(heatsinkTempC, 1).c_str() : "n/a");
   }
 }
 
@@ -687,6 +851,45 @@ void IRAM_ATTR onEncoderChange() {
 void handleEncoderAndButton() {
   unsigned long now = millis();
 
+  if (inCalibrationMode) {
+    // Self-contained: rotation adjusts the working ratio live, click
+    // confirms and saves, long-press cancels. Duplicates the button
+    // debounce logic below rather than sharing it -- the two modes'
+    // actions are different enough that a shared/parameterized helper
+    // would be more confusing than the small duplication.
+    noInterrupts();
+    int32_t raw = encoderRawCount;
+    interrupts();
+    int32_t rawDelta = raw - encoderLastConsumedCount;
+    int32_t rawDetents = rawDelta / ENCODER_EDGES_PER_DETENT;
+    if (rawDetents != 0) {
+      encoderLastConsumedCount += rawDetents * ENCODER_EDGES_PER_DETENT;
+      int32_t detents = ENCODER_REVERSED ? -rawDetents : rawDetents;
+      calibrationRatio = constrain(calibrationRatio + detents * CALIBRATION_RATIO_STEP,
+                                    CALIBRATION_RATIO_MIN, CALIBRATION_RATIO_MAX);
+    }
+
+    bool rawPressed = (digitalRead(ENCODER_SW_PIN) == LOW);
+    if (rawPressed != buttonLastRaw) {
+      buttonLastRaw = rawPressed;
+      buttonLastChangeMs = now;
+    }
+    if ((now - buttonLastChangeMs) >= BUTTON_DEBOUNCE_MS && rawPressed != buttonStable) {
+      buttonStable = rawPressed;
+      if (buttonStable) {
+        buttonPressStartMs = now;
+        buttonLongPressFired = false;
+      } else if (!buttonLongPressFired) {
+        exitCalibrationMode(true); // short click -- confirm and save
+      }
+    }
+    if (buttonStable && !buttonLongPressFired && (now - buttonPressStartMs) >= LONG_PRESS_MS) {
+      buttonLongPressFired = true;
+      exitCalibrationMode(false); // long-press -- cancel
+    }
+    return;
+  }
+
   // A deferred settings save from the last rotation lands once the
   // overlay it triggered actually dismisses, rather than on every
   // single detent while the user is still spinning the encoder.
@@ -704,6 +907,16 @@ void handleEncoderAndButton() {
   if (rawDetents != 0) {
     encoderLastConsumedCount += rawDetents * ENCODER_EDGES_PER_DETENT;
     int32_t detents = ENCODER_REVERSED ? -rawDetents : rawDetents;
+
+    if (buttonStable && chargeState == STATE_IDLE && !buttonLongPressFired) {
+      // Held button + turn -- a deliberate two-handed gesture, distinct
+      // from a plain long-press. Setting buttonLongPressFired suppresses
+      // both this press's eventual short-click-on-release and the timed
+      // mode-toggle long-press below, for this same button press.
+      buttonLongPressFired = true;
+      enterCalibrationMode();
+      return;
+    }
 
     if (chargeState == STATE_IDLE) {
       if (useEasyMode) {
@@ -815,19 +1028,25 @@ void drawBatteryIcon(int x, int y, int w, int h, float fraction) {
   if (fillW > 0) u8g2.drawBox(x + 2, y + 2, fillW, h - 4);
 }
 
+// Two baseline sets, shared by every full-screen readout below: one for
+// screens with nothing fixed below the big text (drawBigOverlay), one
+// raised for screens that have a fixed line at y=62 below it
+// (drawFaultScreen, updateCalibrationScreen) -- the un-raised set's 32pt
+// baseline (58) would put that font's glyph body (it reaches ~32px above
+// its own baseline) directly on top of a line at y=62.
+static const int kBaselineNoBottomLine[] = {58, 50, 40};
+static const int kBaselineWithBottomLine[] = {48, 42, 34};
+
 // Draws text horizontally centered, using the biggest of three font
 // sizes that still fits within maxWidth px -- so a short string gets to
 // fill the screen while a longer one never clips. The smallest
 // (logisoso16, already used elsewhere on this display and known to fit
 // anything reasonable) is the guaranteed-fit fallback. baselineY is the
 // per-font-tier baseline to use (indices matching the 32pt/24pt/16pt
-// font order) -- callers pass their own since how much clearance is
-// needed below the text depends on what else is on that particular
-// screen (drawBigOverlay has nothing below it; drawFaultScreen has a
-// fixed reason line at y=62 that the default overlay baselines used to
-// overlap). Leaves the font set to whichever one it used; callers
-// needing a different font afterward (e.g. a small label) must set it
-// themselves.
+// font order) -- pass one of the two arrays above depending on whether
+// this screen has something fixed below the text. Leaves the font set
+// to whichever one it used; callers needing a different font afterward
+// (e.g. a small label) must set it themselves.
 void drawBigCentered(const char* text, int maxWidth, const int baselineY[3]) {
   const uint8_t* bigFonts[] = {u8g2_font_logisoso32_tf, u8g2_font_logisoso24_tf, u8g2_font_logisoso16_tf};
   for (uint8_t i = 0; i < 3; i++) {
@@ -858,8 +1077,7 @@ void drawBigOverlay() {
   drawStrFit(0, 9, 128, label);
   u8g2.drawHLine(0, 12, 128);
 
-  static const int kOverlayBaselineY[] = {58, 50, 40};
-  drawBigCentered(buf, 124, kOverlayBaselineY);
+  drawBigCentered(buf, 124, kBaselineNoBottomLine);
 }
 
 // Fault takes over the whole screen -- the word itself as big as will
@@ -868,17 +1086,41 @@ void drawBigOverlay() {
 // vary in length and several are too long for this font at full size,
 // see the display-overflow fixes earlier in this project's history).
 void drawFaultScreen() {
-  // Raised vs. the overlay's baselines -- this screen has a fixed
-  // reason line at y=62 below it that the overlay's {58,50,40} would
-  // overlap (the 32pt font reaches ~32px above its own baseline).
-  static const int kFaultBaselineY[] = {48, 42, 34};
-  drawBigCentered("FAULT", 124, kFaultBaselineY);
+  drawBigCentered("FAULT", 124, kBaselineWithBottomLine);
   u8g2.setFont(u8g2_font_6x10_tf);
   drawStrFit(0, 62, 128, faultReason.c_str());
 }
 
+// Divider calibration screen -- shows the ADC-side voltage computed with
+// the WORKING (unsaved) ratio, live, so it can be compared directly
+// against a multimeter on the supply rail while adjusting. See
+// enterCalibrationMode()/exitCalibrationMode().
+void updateCalibrationScreen() {
+  u8g2.setFont(u8g2_font_6x10_tf);
+  drawStrFit(0, 9, 128, "Divider calibration");
+  u8g2.drawHLine(0, 12, 128);
+
+  uint32_t sumMv = 0;
+  for (uint8_t i = 0; i < SUPPLY_ADC_SAMPLES; i++) sumMv += analogReadMilliVolts(SUPPLY_VOLTAGE_DIVIDER_PIN);
+  float avgV = (sumMv / (float)SUPPLY_ADC_SAMPLES) / 1000.0f;
+  float liveVoltage = avgV * calibrationRatio;
+
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%.2fV", liveVoltage);
+  drawBigCentered(buf, 124, kBaselineWithBottomLine);
+
+  u8g2.setFont(u8g2_font_6x10_tf);
+  drawStrFit(0, 62, 128, "Turn=adjust  Click=save  Hold=X");
+}
+
 void updateDisplay() {
   u8g2.clearBuffer();
+
+  if (inCalibrationMode) {
+    updateCalibrationScreen();
+    u8g2.sendBuffer();
+    return;
+  }
 
   if (chargeState == STATE_IDLE && millis() < bigOverlayUntilMs) {
     drawBigOverlay();
@@ -922,26 +1164,36 @@ void updateDisplay() {
 
   // Bottom context line -- always width-checked, never assumed to fit.
   // STATE_FAULT never reaches here -- it returns early above via
-  // drawFaultScreen(), which takes over the whole display.
+  // drawFaultScreen(), which takes over the whole display. Heatsink temp
+  // (when the sensor's working) is appended to whichever line is active
+  // during charging -- drawStrFit() truncates it off gracefully rather
+  // than crowding out the more important part of the line if it doesn't
+  // fit.
+  char tempSuffix[10] = "";
+  if (heatsinkSensorOk && !isnan(heatsinkTempC)) {
+    snprintf(tempSuffix, sizeof(tempSuffix), " %.0fC", heatsinkTempC);
+  }
   u8g2.setFont(u8g2_font_6x10_tf);
   if (chargeState == STATE_RECOVERY) {
     unsigned long elapsedMs = millis() - recoveryStartMs;
     unsigned long remainMin = (elapsedMs >= RECOVERY_TIMEOUT_MS) ? 0 : (RECOVERY_TIMEOUT_MS - elapsedMs) / 60000UL;
-    char recLine[24];
-    snprintf(recLine, sizeof(recLine), "Recovery, ~%lum left", remainMin);
+    char recLine[32];
+    snprintf(recLine, sizeof(recLine), "Recovery, ~%lum left%s", remainMin, tempSuffix);
     drawStrFit(0, 62, 128, recLine);
   } else if (chargeState == STATE_DONE) {
     drawStrFit(0, 62, 128, "Charged -- click to reset");
   } else if (chargeState == STATE_ABSORPTION) {
-    drawStrFit(0, 62, 128, "Topping off...");
+    char absLine[24];
+    snprintf(absLine, sizeof(absLine), "Topping off...%s", tempSuffix);
+    drawStrFit(0, 62, 128, absLine);
   } else if (chargeState == STATE_BULK) {
     float remainingAh = max(0.0f, (1.0f - socFraction)) *
         (selectedCapacityAh > 0 ? selectedCapacityAh : (targetCurrentA / BULK_CURRENT_FRACTION_OF_CAPACITY));
     float etaHours = (busCurrent > 0.05f) ? (remainingAh / busCurrent) : 0.0f;
     int hh = (int)etaHours;
     int mm = (int)((etaHours - hh) * 60);
-    char etaLine[24];
-    snprintf(etaLine, sizeof(etaLine), "ETA ~%dh%02dm to absorb", hh, mm);
+    char etaLine[32];
+    snprintf(etaLine, sizeof(etaLine), "ETA ~%dh%02dm to absorb%s", hh, mm, tempSuffix);
     drawStrFit(0, 62, 128, etaLine);
   } else { // IDLE
     char idleLine[24];
@@ -997,6 +1249,14 @@ void setup() {
     digitalWrite(BUZZER_PIN, LOW);
   }
 
+  heatsinkTempSensor.begin();
+  heatsinkTempSensor.setWaitForConversion(false); // non-blocking -- see updateHeatsinkTemp()
+  {
+    int dsCount = heatsinkTempSensor.getDeviceCount();
+    Serial.printf("[temp] DS18B20 devices found: %d%s\n", dsCount,
+                  dsCount == 0 ? " -- check wiring/pull-up on GPIO2" : "");
+  }
+
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   if (!ina219.begin()) {
     Serial.println("[ina219] FAILED to initialize -- check wiring/address");
@@ -1007,12 +1267,13 @@ void setup() {
   u8g2.begin();
 
   pinMode(SUPPLY_VOLTAGE_DIVIDER_PIN, INPUT);
-  Serial.printf("[supply] measured rail = %.2fV (calibrate SUPPLY_DIVIDER_RATIO against a multimeter)\n",
-                readSupplyVoltage());
 
   loadPersistedSettings();
   chargeState = STATE_IDLE; // never auto-resume charging after a reboot
   updateStatusLedForState();
+
+  Serial.printf("[supply] measured rail = %.2fV (ratio=%.3f -- hold the button and turn the encoder to calibrate)\n",
+                readSupplyVoltage(), runtimeDividerRatio);
 
   lastControlLoopMs = millis();
   Serial.println("[boot] ready");
@@ -1021,6 +1282,7 @@ void setup() {
 void loop() {
   handleEncoderAndButton();
   updateBuzzer();
+  updateHeatsinkTemp();
 
   unsigned long now = millis();
   if (now - lastControlLoopMs >= CONTROL_LOOP_INTERVAL_MS) {
