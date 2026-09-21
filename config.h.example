@@ -14,7 +14,7 @@
 // checked, so settings were never actually persisting despite the code
 // looking complete. Keep this at 15 characters or fewer if you rename it.
 static const char* DEVICE_ID        = "cbc1";
-static const char* FIRMWARE_VERSION = "1.9.2";
+static const char* FIRMWARE_VERSION = "1.10.0";
 
 // ------------------------------------------------------------------
 // Hardware -- I2C bus (INA219 current/voltage sensor + SH1106 OLED)
@@ -228,7 +228,42 @@ static const float SUPPLY_VOLTAGE       = 26.0f; // nominal only -- the real sup
 static const float BULK_TARGET_VOLTAGE  = 14.4f; // bulk ends, absorption starts here
 static const float ABSORPTION_VOLTAGE   = 14.6f; // held constant during absorption
 static const float OVER_VOLTAGE_CUTOFF  = 15.0f; // immediate hard stop, any stage
-static const float NO_BATTERY_VOLTAGE_THRESHOLD = 8.0f; // below this at start = nothing plausible connected
+// Below this at start, refuse outright -- an open circuit or truly
+// disconnected battery reads close to 0V, so this is a low floor, not
+// "is this battery healthy". Deliberately much lower than
+// RECOVERY_ENTRY_VOLTAGE_THRESHOLD below: everything between the two is
+// a real, if severely discharged (or partially shorted), battery that
+// RECOVERY will attempt rather than refuse.
+static const float NO_BATTERY_VOLTAGE_THRESHOLD = 2.0f;
+
+// ------------------------------------------------------------------
+// Recovery stage -- for batteries too deeply discharged to trust with
+// full bulk current right away. A lead-acid battery resting below
+// RECOVERY_ENTRY_VOLTAGE_THRESHOLD could just be very flat, but it could
+// also have a shorted cell (each cell is nominally ~2V resting, so one
+// shorted cell reads ~2V low, two ~4V low, etc.) -- and dumping the full
+// selected bulk current into a shorted cell is how you rupture a
+// battery, not charge it. RECOVERY holds a much smaller current instead,
+// and only ever proceeds to BULK once the battery actually responds by
+// recovering past RECOVERY_EXIT_VOLTAGE. If it never does within
+// RECOVERY_TIMEOUT_MS, that's treated as a real fault (likely a bad
+// battery), not something to keep trying past.
+// ------------------------------------------------------------------
+static const float RECOVERY_ENTRY_VOLTAGE_THRESHOLD = 8.0f; // below this at start -> RECOVERY instead of BULK
+static const float RECOVERY_EXIT_VOLTAGE = 10.0f;            // recovers past this -> graduates to BULK
+// Recovery current: a small fraction of capacity in easy mode (much
+// smaller than BULK_CURRENT_FRACTION_OF_CAPACITY -- this is a cautious
+// probe, not a charge rate), or a fixed low default in manual mode where
+// capacity isn't known. Both are still clamped to
+// [MANUAL_CURRENT_MIN_A, MAX_CHARGE_CURRENT_A] like any other current.
+static const float RECOVERY_CURRENT_FRACTION_OF_CAPACITY = 0.02f; // C/50
+static const float RECOVERY_DEFAULT_CURRENT_A = 0.5f;
+static const uint32_t RECOVERY_TIMEOUT_MS = 30UL * 60 * 1000UL; // 30 min
+// Tighter than OVER_CURRENT_FAULT_FACTOR -- recovery current is
+// intentionally tiny, so drawing much more than that (a hard short)
+// should fault out fast rather than wait for a threshold sized for full
+// bulk current.
+static const float RECOVERY_OVER_CURRENT_FACTOR = 1.5f;
 
 // Bulk-stage current as a fraction of capacity for "easy mode" (0.1 = C/10,
 // a conservative slow-charge rate safe for old/unknown-condition batteries).
@@ -272,11 +307,16 @@ static const uint32_t OVER_CURRENT_FAULT_DWELL_MS = 1000UL;
 static const float CHARGE_EFFICIENCY = 0.85f;
 
 // ------------------------------------------------------------------
-// Easy-mode battery capacity presets (Ah) -- rotary-encoder selectable
+// Easy-mode battery capacity presets (Ah) -- rotary-encoder selectable.
+// 3/5/10Ah cover small SLA batteries (alarms, UPS, small powersports),
+// not just full-size car batteries -- BULK_CURRENT_FRACTION_OF_CAPACITY
+// (C/10) still applies, so e.g. the 3Ah preset charges at 0.3A, well
+// above MANUAL_CURRENT_MIN_A so it isn't clamped up to a faster rate
+// than intended.
 // ------------------------------------------------------------------
-static const uint16_t CAPACITY_PRESETS_AH[] = {44, 50, 55, 60, 65, 70, 80, 85, 90, 100};
+static const uint16_t CAPACITY_PRESETS_AH[] = {3, 5, 10, 44, 50, 55, 60, 65, 70, 80, 85, 90, 100};
 static const uint8_t CAPACITY_PRESETS_COUNT = sizeof(CAPACITY_PRESETS_AH) / sizeof(CAPACITY_PRESETS_AH[0]);
-static const uint8_t DEFAULT_CAPACITY_PRESET_INDEX = 3; // 60Ah, a common car-battery size
+static const uint8_t DEFAULT_CAPACITY_PRESET_INDEX = 6; // 60Ah, a common car-battery size
 
 // ------------------------------------------------------------------
 // Manual-mode current selection (encoder-adjustable when not using a

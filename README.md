@@ -226,8 +226,22 @@ the tones. Set `BUZZER_ENABLED = false` to disable it entirely.
 
 ## Charge algorithm
 
-Three stages for flooded/AGM lead-acid, no continuous float:
+Stages for flooded/AGM lead-acid, no continuous float:
 
+0. **Recovery** (only if the battery's resting voltage is below
+   `RECOVERY_ENTRY_VOLTAGE_THRESHOLD`, 8V default) — a deeply discharged
+   battery in this range might just be flat, but it could also have a
+   shorted cell (each cell rests at ~2V, so one shorted cell reads ~2V
+   low, two ~4V low, and so on) — and pushing the full selected bulk
+   current into a shorted cell is how a battery ruptures, not how it
+   charges. Recovery holds a much smaller current instead (a small
+   fraction of capacity in easy mode, or a fixed low default in manual
+   mode — see `RECOVERY_CURRENT_FRACTION_OF_CAPACITY`/
+   `RECOVERY_DEFAULT_CURRENT_A`), with its own tighter over-current
+   check. It graduates to Bulk once the battery actually responds by
+   recovering past `RECOVERY_EXIT_VOLTAGE` (10V default); if it never
+   does within `RECOVERY_TIMEOUT_MS` (30 min default), that's a real
+   fault — likely a bad battery — not something to keep trying past.
 1. **Bulk** — constant current at the selected target, until the battery
    reaches `BULK_TARGET_VOLTAGE` (14.4V default).
 2. **Absorption** — constant voltage (`ABSORPTION_VOLTAGE`, 14.6V
@@ -240,9 +254,14 @@ Three stages for flooded/AGM lead-acid, no continuous float:
 
 Safety nets that run independently of the control loop: hard
 over-voltage cutoff (15V), hard over-current fault (125% of the current
-limit, sustained), an absolute 14h max-duration timeout, and a "no
-battery detected" refusal to start if the resting voltage isn't
-plausible (below 8V).
+limit, sustained — tighter during Recovery, 150% of the much lower
+recovery current), an absolute 14h max-duration timeout (covering the
+whole session, recovery included), and a "no battery detected" refusal
+to start if the resting voltage isn't plausible at all (below 2V — a
+genuinely open circuit or disconnected battery reads close to 0V; this
+is a much lower bar than the recovery threshold, deliberately, since
+everything between the two is now a real battery Recovery will attempt
+rather than refuse).
 
 State-of-charge is estimated from the battery's resting (open-circuit)
 voltage right before a charge starts, then tracked forward by coulomb
@@ -278,22 +297,25 @@ overlay" below).
   (`MANUAL_CURRENT_STEP_A` per detent) — takes effect immediately.
   Click to start charging at that current.
 - **Idle, easy mode**: rotate to step through the capacity presets in
-  `CAPACITY_PRESETS_AH` (44/50/55/60/65/70/80/85/90/100 Ah) — each one
-  sets target current to `BULK_CURRENT_FRACTION_OF_CAPACITY` × capacity
-  (C/10 by default — 10A for the 100Ah preset, see the thermal warning
-  above), applied immediately as you turn it. Click to start charging.
+  `CAPACITY_PRESETS_AH` (3/5/10/44/50/55/60/65/70/80/85/90/100 Ah — the
+  3/5/10Ah presets cover small SLA batteries like alarms/UPS/powersports,
+  not just full-size car batteries) — each one sets target current to
+  `BULK_CURRENT_FRACTION_OF_CAPACITY` × capacity (C/10 by default — 10A
+  for the 100Ah preset, see the thermal warning above), applied
+  immediately as you turn it. Click to start charging.
 - **Idle, long-press**: instantly toggles between manual and easy mode
   (using whichever capacity preset was last selected). No picker, no
   confirm — the mode just switches, and the readout confirms which one
   you're in now.
-- **While charging**: click stops immediately and returns to idle.
-  Rotation and long-press are ignored while active — stop first to
-  change settings.
+- **While charging (including Recovery)**: click stops immediately and
+  returns to idle. Rotation and long-press are ignored while active —
+  stop first to change settings.
 - **Done / Fault**: click acknowledges and returns to idle.
 
 The onboard status LED (if present/enabled) mirrors state at a glance:
-blue = idle, yellow = bulk, orange = absorption, green = done, red =
-fault. The buzzer backs this up audibly — see "Piezo buzzer" above — so
+blue = idle, magenta = recovery, yellow = bulk, orange = absorption,
+green = done, red = fault. The buzzer backs this up audibly — see
+"Piezo buzzer" above — so
 a state change registers even if you're not looking at the device.
 
 Uses `NEO_RGB` color order, not the more common `NEO_GRB` — that's what
@@ -390,6 +412,21 @@ a known-accurate ammeter, given the custom shunt) that measured
 voltage/current match the OLED and Serial readings before leaving it
 unattended.
 
+**The Recovery stage is the most safety-relevant thing in this
+firmware and I could not test it on a real damaged battery.** The logic
+(hold a small current, watch for a voltage response, time out as a
+fault if none comes) follows standard recovery-charging practice for
+deeply discharged lead-acid, but "attempt a low current into a battery
+that might have a shorted cell" is inherently a judgment call about
+what's safe, not something I can verify from documentation alone. If
+you have a battery you specifically know is bad (shorted cell, physical
+damage), don't use this as a substitute for testing it with a proper
+battery analyzer first — this firmware can only react to voltage and
+current, it has no way to detect swelling, heat, or electrolyte
+issues. Watch it in person for the first several minutes of any
+Recovery attempt, the same way you'd watch a Bulk stage on a new
+battery for the first time.
+
 One specific thing I couldn't verify: `drawBigOverlay()` uses
 `u8g2_font_logisoso32_tf` and `u8g2_font_logisoso24_tf` for the
 full-screen readout, on top of the `u8g2_font_logisoso16_tf` already
@@ -419,3 +456,4 @@ for the closest available size in that family and swap it into the
 | v1.9.0 | 2026-09-21 | Fault now takes over the whole display (`drawFaultScreen()`) instead of sharing the normal 4-band status screen: "FAULT" as big as fits, fault reason in small text at the bottom. Extracted the biggest-font-that-fits logic from `drawBigOverlay()` into a shared `drawBigCentered()` helper used by both. |
 | v1.9.1 | 2026-09-21 | Fixed the fault screen's big "FAULT" text overlapping the reason text below it -- the 32pt font's baseline (58) put its glyph body directly on top of the fixed reason line at y=62, since a font that tall reaches ~32px above its own baseline. Raised all three `drawBigCentered()` baselines (48/42/34) for proper clearance. |
 | v1.9.2 | 2026-09-21 | v1.9.1 raised the shared baseline table, which regressed the capacity/current overlay's positioning too -- it never had an overlap problem, only the fault screen did. `drawBigCentered()` now takes its baseline array as a parameter instead of a hardcoded shared one; the overlay keeps its original {58,50,40}, the fault screen keeps the raised {48,42,34}. |
+| v1.10.0 | 2026-09-21 | Added 3/5/10Ah to the capacity presets (small SLA batteries, not just full-size car batteries) -- `DEFAULT_CAPACITY_PRESET_INDEX` shifted from 3 to 6 to keep pointing at 60Ah. Added a new Recovery stage (`STATE_RECOVERY`) for batteries resting below `RECOVERY_ENTRY_VOLTAGE_THRESHOLD` (8V default) -- previously refused outright as "no battery detected"; now attempts a cautious, much lower current first (since a shorted cell can read in this same range, and full bulk current into a short is how a battery ruptures), graduating to Bulk once it recovers past `RECOVERY_EXIT_VOLTAGE` (10V) or faulting as unresponsive after `RECOVERY_TIMEOUT_MS` (30 min). `NO_BATTERY_VOLTAGE_THRESHOLD` (the real "nothing plausible connected" floor) lowered from 8V to 2V accordingly. |

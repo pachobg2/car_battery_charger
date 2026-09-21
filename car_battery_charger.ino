@@ -32,6 +32,15 @@
  * always needs a USB cable.
  *
  * Charge algorithm (flooded/AGM lead-acid):
+ *   RECOVERY: entered instead of BULK if the battery's resting voltage
+ *         is below RECOVERY_ENTRY_VOLTAGE_THRESHOLD -- too deep to trust
+ *         with full bulk current right away (a shorted cell can read
+ *         anywhere in this range too). Holds a much lower current
+ *         (RECOVERY_CURRENT_FRACTION_OF_CAPACITY or
+ *         RECOVERY_DEFAULT_CURRENT_A in manual mode) with its own
+ *         tighter over-current check, and either graduates to BULK once
+ *         voltage recovers past RECOVERY_EXIT_VOLTAGE, or faults out as
+ *         unresponsive after RECOVERY_TIMEOUT_MS.
  *   BULK: constant current (targetCurrentA) until battery reaches
  *         BULK_TARGET_VOLTAGE.
  *   ABSORPTION: constant voltage (ABSORPTION_VOLTAGE), current tapers
@@ -41,10 +50,12 @@
  *         stopped entirely (no continuous float stage). Restarting
  *         requires an explicit click.
  * Safety nets independent of the control loop: hard over-voltage cutoff,
- * hard over-current fault, absolute max charge duration, and a "no
- * battery detected" refusal to start if the sensed voltage isn't
- * plausible. Charging never auto-resumes after a reboot/power loss --
- * always requires a fresh explicit start.
+ * hard over-current fault (plus a tighter one specific to the recovery
+ * stage), absolute max charge duration, and a "no battery detected"
+ * refusal to start if the sensed voltage isn't plausible at all (a much
+ * lower bar than the recovery threshold -- see NO_BATTERY_VOLTAGE_THRESHOLD
+ * in config.h.example). Charging never auto-resumes after a reboot/power
+ * loss -- always requires a fresh explicit start.
  *
  * Local UI: rotating the encoder while idle adjusts the live value --
  * manual target current, or the capacity preset (from config.h's
@@ -89,11 +100,12 @@
 // ------------------------------------------------------------------
 // Charge state machine
 // ------------------------------------------------------------------
-enum ChargeState { STATE_IDLE, STATE_BULK, STATE_ABSORPTION, STATE_DONE, STATE_FAULT };
+enum ChargeState { STATE_IDLE, STATE_RECOVERY, STATE_BULK, STATE_ABSORPTION, STATE_DONE, STATE_FAULT };
 
 const char* chargeStateName(ChargeState s) {
   switch (s) {
     case STATE_IDLE:       return "Idle";
+    case STATE_RECOVERY:   return "Recovery";
     case STATE_BULK:       return "Bulk";
     case STATE_ABSORPTION: return "Absorption";
     case STATE_DONE:       return "Done";
@@ -144,6 +156,13 @@ unsigned long chargeStartMs = 0;
 unsigned long absorptionStartMs = 0;
 unsigned long belowTerminationSinceMs = 0; // 0 = not currently below threshold
 unsigned long overCurrentFaultSinceMs = 0; // 0 = not currently over
+
+// Recovery stage (STATE_RECOVERY) -- a cautious low-current attempt for
+// batteries too deeply discharged to trust with full bulk current
+// straight away. See RECOVERY_* in config.h.example for the reasoning.
+float recoveryCurrentA = 0.0f;             // computed fresh at the start of each recovery attempt
+unsigned long recoveryStartMs = 0;
+unsigned long recoveryOverCurrentSinceMs = 0; // 0 = not currently over -- tighter than the general over-current check
 
 uint16_t gateDuty = 0;          // current commanded duty, 0..GATE_PWM_MAX_DUTY
 bool softStarting = false;
@@ -256,6 +275,7 @@ void setStatusLed(uint8_t r, uint8_t g, uint8_t b) {
 void updateStatusLedForState() {
   switch (chargeState) {
     case STATE_IDLE:       setStatusLed(0, 0, STATUS_LED_BRIGHTNESS); break;             // blue
+    case STATE_RECOVERY:   setStatusLed(STATUS_LED_BRIGHTNESS, 0, STATUS_LED_BRIGHTNESS); break; // magenta -- distinct from every other stage
     case STATE_BULK:       setStatusLed(STATUS_LED_BRIGHTNESS, STATUS_LED_BRIGHTNESS, 0); break; // yellow
     case STATE_ABSORPTION: setStatusLed(STATUS_LED_BRIGHTNESS, STATUS_LED_BRIGHTNESS / 2, 0); break; // orange
     case STATE_DONE:       setStatusLed(0, STATUS_LED_BRIGHTNESS, 0); break;             // green
@@ -415,7 +435,7 @@ void applyGateDuty(uint16_t duty) {
 // Charge control
 // ------------------------------------------------------------------
 void startCharging() {
-  if (chargeState == STATE_BULK || chargeState == STATE_ABSORPTION) return;
+  if (chargeState == STATE_RECOVERY || chargeState == STATE_BULK || chargeState == STATE_ABSORPTION) return;
 
   // Take one reading with the MOSFET still off to sanity-check that a
   // battery is actually connected, and to seed the SoC estimate from its
@@ -444,16 +464,32 @@ void startCharging() {
   piIntegral = 0.0f;
   belowTerminationSinceMs = 0;
   overCurrentFaultSinceMs = 0;
+  recoveryOverCurrentSinceMs = 0;
   chargeStartMs = millis();
-  chargeState = STATE_BULK;
   faultReason = "";
+
+  if (ocv < RECOVERY_ENTRY_VOLTAGE_THRESHOLD) {
+    // Too deep to trust with full bulk current straight away -- a
+    // shorted cell can read anywhere in this range too, and dumping the
+    // normal target current into that is how a battery ruptures. Try a
+    // cautious, much lower current first; see config.h.example.
+    recoveryCurrentA = useEasyMode
+        ? constrain(selectedCapacityAh * RECOVERY_CURRENT_FRACTION_OF_CAPACITY, MANUAL_CURRENT_MIN_A, MAX_CHARGE_CURRENT_A)
+        : constrain(RECOVERY_DEFAULT_CURRENT_A, MANUAL_CURRENT_MIN_A, MAX_CHARGE_CURRENT_A);
+    recoveryStartMs = chargeStartMs;
+    chargeState = STATE_RECOVERY;
+    Serial.printf("[charge] START recovery, current=%.2fA ocv=%.2fV (below %.1fV recovery threshold)\n",
+                  recoveryCurrentA, ocv, RECOVERY_ENTRY_VOLTAGE_THRESHOLD);
+  } else {
+    chargeState = STATE_BULK;
+    Serial.printf("[charge] START target=%.2fA ocv=%.2fV initialSoC=%.0f%%\n",
+                  targetCurrentA, ocv, initialSocFraction * 100.0f);
+  }
 
   softStarting = true;
   softStartBeginMs = millis();
   applyGateDuty(0);
 
-  Serial.printf("[charge] START target=%.2fA ocv=%.2fV initialSoC=%.0f%%\n",
-                targetCurrentA, ocv, initialSocFraction * 100.0f);
   updateStatusLedForState();
   startBeepPattern(BUZZER_START_FREQ_HZ, BUZZER_START_DUR_MS, BEEP_LEN(BUZZER_START_FREQ_HZ));
 }
@@ -486,7 +522,7 @@ void controlLoop() {
   busVoltage = readBatteryVoltage();
   busCurrent = max(0.0f, readIna219CurrentA()); // this design only ever sources current one way
 
-  if (chargeState != STATE_BULK && chargeState != STATE_ABSORPTION) return;
+  if (chargeState != STATE_RECOVERY && chargeState != STATE_BULK && chargeState != STATE_ABSORPTION) return;
 
   // ---- Safety nets, independent of the control loop below ----
   if (busVoltage >= OVER_VOLTAGE_CUTOFF) {
@@ -496,6 +532,19 @@ void controlLoop() {
   if (now - chargeStartMs >= MAX_CHARGE_DURATION_MS) {
     stopCharging(STATE_FAULT, "Max charge duration exceeded");
     return;
+  }
+  if (chargeState == STATE_RECOVERY && busCurrent >= recoveryCurrentA * RECOVERY_OVER_CURRENT_FACTOR) {
+    // Tighter than the general over-current check below -- recovery
+    // current is intentionally tiny, so drawing much more than that
+    // (a hard-shorted cell, say) should fault out fast rather than
+    // wait for a threshold sized for full bulk current.
+    if (recoveryOverCurrentSinceMs == 0) recoveryOverCurrentSinceMs = now;
+    if (now - recoveryOverCurrentSinceMs >= OVER_CURRENT_FAULT_DWELL_MS) {
+      stopCharging(STATE_FAULT, "Recovery over-current -- possible shorted cell");
+      return;
+    }
+  } else {
+    recoveryOverCurrentSinceMs = 0;
   }
   if (busCurrent >= MAX_CHARGE_CURRENT_A * OVER_CURRENT_FAULT_FACTOR) {
     if (overCurrentFaultSinceMs == 0) overCurrentFaultSinceMs = now;
@@ -529,7 +578,22 @@ void controlLoop() {
   }
 
   // ---- State machine + PI control ----
-  if (chargeState == STATE_BULK) {
+  if (chargeState == STATE_RECOVERY) {
+    if (busVoltage >= RECOVERY_EXIT_VOLTAGE) {
+      chargeState = STATE_BULK;
+      piIntegral = 0.0f;
+      Serial.println("[charge] RECOVERY -> BULK (battery responded)");
+      updateStatusLedForState();
+    } else if (now - recoveryStartMs >= RECOVERY_TIMEOUT_MS) {
+      stopCharging(STATE_FAULT, "Recovery failed -- battery unresponsive");
+      return;
+    } else {
+      float error = recoveryCurrentA - busCurrent;
+      piIntegral = constrain(piIntegral + error * dtSec, -PI_INTEGRAL_CLAMP, PI_INTEGRAL_CLAMP);
+      float duty = BULK_KP * error + BULK_KI * piIntegral; // same gains as bulk -- both are constant-current loops
+      applyGateDuty((uint16_t)constrain(duty, 0.0f, (float)maxDutyThisTick));
+    }
+  } else if (chargeState == STATE_BULK) {
     if (busVoltage >= BULK_TARGET_VOLTAGE) {
       chargeState = STATE_ABSORPTION;
       absorptionStartMs = now;
@@ -675,7 +739,7 @@ void handleEncoderAndButton() {
         // ---- short click ----
         if (chargeState == STATE_IDLE) {
           startCharging();
-        } else if (chargeState == STATE_BULK || chargeState == STATE_ABSORPTION) {
+        } else if (chargeState == STATE_RECOVERY || chargeState == STATE_BULK || chargeState == STATE_ABSORPTION) {
           stopCharging(STATE_IDLE, "Stopped by user");
         } else { // DONE or FAULT -- acknowledge and return to idle
           chargeState = STATE_IDLE;
@@ -844,7 +908,7 @@ void updateDisplay() {
   char socStr[8];
   snprintf(socStr, sizeof(socStr), "%.0f%%", socFraction * 100.0f);
   u8g2.drawStr(94, 27, socStr);
-  if (chargeState == STATE_BULK || chargeState == STATE_ABSORPTION) {
+  if (chargeState == STATE_RECOVERY || chargeState == STATE_BULK || chargeState == STATE_ABSORPTION) {
     u8g2.drawDisc(123, 23, 2);
   }
 
@@ -860,7 +924,13 @@ void updateDisplay() {
   // STATE_FAULT never reaches here -- it returns early above via
   // drawFaultScreen(), which takes over the whole display.
   u8g2.setFont(u8g2_font_6x10_tf);
-  if (chargeState == STATE_DONE) {
+  if (chargeState == STATE_RECOVERY) {
+    unsigned long elapsedMs = millis() - recoveryStartMs;
+    unsigned long remainMin = (elapsedMs >= RECOVERY_TIMEOUT_MS) ? 0 : (RECOVERY_TIMEOUT_MS - elapsedMs) / 60000UL;
+    char recLine[24];
+    snprintf(recLine, sizeof(recLine), "Recovery, ~%lum left", remainMin);
+    drawStrFit(0, 62, 128, recLine);
+  } else if (chargeState == STATE_DONE) {
     drawStrFit(0, 62, 128, "Charged -- click to reset");
   } else if (chargeState == STATE_ABSORPTION) {
     drawStrFit(0, 62, 128, "Topping off...");
