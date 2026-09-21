@@ -185,7 +185,9 @@ void controlLoop();
 void updateDisplay();
 void drawStrFit(int x, int y, int maxWidth, const char* text);
 void drawBatteryIcon(int x, int y, int w, int h, float fraction);
+void drawBigCentered(const char* text, int maxWidth);
 void drawBigOverlay();
+void drawFaultScreen();
 void handleEncoderAndButton();
 void applyGateDuty(uint16_t duty);
 float estimateSocFromOcv(float v);
@@ -749,14 +751,29 @@ void drawBatteryIcon(int x, int y, int w, int h, float fraction) {
   if (fillW > 0) u8g2.drawBox(x + 2, y + 2, fillW, h - 4);
 }
 
+// Draws text horizontally centered, using the biggest of three font
+// sizes that still fits within maxWidth px -- so a short string gets to
+// fill the screen while a longer one never clips. The smallest
+// (logisoso16, already used elsewhere on this display and known to fit
+// anything reasonable) is the guaranteed-fit fallback. Leaves the font
+// set to whichever one it used; callers needing a different font
+// afterward (e.g. a small label) must set it themselves.
+void drawBigCentered(const char* text, int maxWidth) {
+  const uint8_t* bigFonts[] = {u8g2_font_logisoso32_tf, u8g2_font_logisoso24_tf, u8g2_font_logisoso16_tf};
+  const int baselineY[] = {58, 50, 40};
+  for (uint8_t i = 0; i < 3; i++) {
+    u8g2.setFont(bigFonts[i]);
+    int w = u8g2.getStrWidth(text);
+    if (w <= maxWidth || i == 2) {
+      u8g2.drawStr((128 - w) / 2, baselineY[i], text);
+      return;
+    }
+  }
+}
+
 // Full-screen readout shown while scrolling a value or right after a
 // mode switch -- see the interaction-model comment on
-// handleEncoderAndButton(). Tries the biggest of three font sizes that
-// still fits the actual string so a short value ("3.5A") gets to fill
-// the screen while the longest possible one ("100Ah") never clips; the
-// smallest of the three (logisoso16, already used elsewhere on this
-// display) is known to fit any string this function ever produces, so
-// it's a safe last resort.
+// handleEncoderAndButton().
 void drawBigOverlay() {
   char buf[16];
   const char* label;
@@ -772,16 +789,18 @@ void drawBigOverlay() {
   drawStrFit(0, 9, 128, label);
   u8g2.drawHLine(0, 12, 128);
 
-  const uint8_t* bigFonts[] = {u8g2_font_logisoso32_tf, u8g2_font_logisoso24_tf, u8g2_font_logisoso16_tf};
-  const int baselineY[] = {58, 50, 40};
-  for (uint8_t i = 0; i < 3; i++) {
-    u8g2.setFont(bigFonts[i]);
-    int w = u8g2.getStrWidth(buf);
-    if (w <= 124 || i == 2) {
-      u8g2.drawStr((128 - w) / 2, baselineY[i], buf);
-      break;
-    }
-  }
+  drawBigCentered(buf, 124);
+}
+
+// Fault takes over the whole screen -- the word itself as big as will
+// fit, with the actual reason in small text at the bottom (drawStrFit,
+// same as everywhere else free-form text gets drawn -- fault reasons
+// vary in length and several are too long for this font at full size,
+// see the display-overflow fixes earlier in this project's history).
+void drawFaultScreen() {
+  drawBigCentered("FAULT", 124);
+  u8g2.setFont(u8g2_font_6x10_tf);
+  drawStrFit(0, 62, 128, faultReason.c_str());
 }
 
 void updateDisplay() {
@@ -789,6 +808,12 @@ void updateDisplay() {
 
   if (chargeState == STATE_IDLE && millis() < bigOverlayUntilMs) {
     drawBigOverlay();
+    u8g2.sendBuffer();
+    return;
+  }
+
+  if (chargeState == STATE_FAULT) {
+    drawFaultScreen();
     u8g2.sendBuffer();
     return;
   }
@@ -821,11 +846,11 @@ void updateDisplay() {
   snprintf(line, sizeof(line), "%.1fA", busCurrent);
   u8g2.drawStr(68, 48, line);
 
-  // Bottom context line -- always width-checked, never assumed to fit
+  // Bottom context line -- always width-checked, never assumed to fit.
+  // STATE_FAULT never reaches here -- it returns early above via
+  // drawFaultScreen(), which takes over the whole display.
   u8g2.setFont(u8g2_font_6x10_tf);
-  if (chargeState == STATE_FAULT) {
-    drawStrFit(0, 62, 128, faultReason.c_str());
-  } else if (chargeState == STATE_DONE) {
+  if (chargeState == STATE_DONE) {
     drawStrFit(0, 62, 128, "Charged -- click to reset");
   } else if (chargeState == STATE_ABSORPTION) {
     drawStrFit(0, 62, 128, "Topping off...");

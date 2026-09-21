@@ -344,6 +344,17 @@ value this ever shows). It auto-dismisses back to the normal screen
 long-press — both in `config.h`. The underlying value applies live as
 you turn it; the overlay is purely a display concern; the click button
 starts/stops charging exactly the same whether or not it's showing.
+
+### Fault screen
+
+A fault (`drawFaultScreen()`) also takes over the whole display, the
+same way the big overlay does — "FAULT" itself as big as fits (same
+biggest-font-that-fits logic, via the shared `drawBigCentered()`
+helper), with the actual reason in small text at the bottom
+(`drawStrFit()`, since fault reasons vary in length and several don't
+fit this font at full width). Unlike the value overlay, this doesn't
+auto-dismiss — it stays up until you click to acknowledge, same as
+before.
 Text that's too long for a 128px-wide display isn't a hypothetical: a
 fixed-length assumption is exactly what let `"(click=start)"` and a
 couple of the longer fault-reason strings get cut off mid-word before.
@@ -405,3 +416,4 @@ for the closest available size in that family and swap it into the
 | v1.6.1 | 2026-09-19 | Widened the battery icon roughly 4x (20px to 86px body width) for a more readable charge-progress indicator; `drawBatteryIcon()` now takes explicit width/height parameters instead of hardcoded dimensions. Repositioned the SoC% text and charging-indicator dot to make room. |
 | v1.7.0 | 2026-09-19 | Replaced the picker-with-confirm capacity/mode UI entirely: rotating the encoder now applies the value live (no confirm step) and shows a full-screen readout (`drawBigOverlay()`, biggest font that fits) that auto-dismisses 3s after the last tick; long-press instantly toggles manual/easy mode instead of opening a picker, showing the same readout for 2s. Removed `UiMode`/`uiMode` and the capacity-select screen entirely -- this also structurally closes the "no way to exit" class of bug from the old modal picker, since there's no longer a separate mode to get stuck in. Added `BIG_OVERLAY_SCROLL_MS`/`BIG_OVERLAY_MODE_SWITCH_MS`. |
 | v1.8.0 | 2026-09-19 | Fixed persisted settings (mode/capacity/target current) never actually saving: `DEVICE_ID` ("car_battery_charger1", 20 chars) exceeded ESP-IDF's 15-character NVS namespace limit, so every `prefs.begin()` call was failing -- silently, since the return value was never checked. Shortened `DEVICE_ID` to `"cbc1"` and added error checking with a Serial Monitor message on both load and save, so a namespace failure is diagnosable instead of settings just quietly resetting to defaults every boot. |
+| v1.9.0 | 2026-09-21 | Fault now takes over the whole display (`drawFaultScreen()`) instead of sharing the normal 4-band status screen: "FAULT" as big as fits, fault reason in small text at the bottom. Extracted the biggest-font-that-fits logic from `drawBigOverlay()` into a shared `drawBigCentered()` helper used by both. |
