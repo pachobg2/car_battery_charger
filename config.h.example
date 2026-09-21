@@ -14,7 +14,7 @@
 // checked, so settings were never actually persisting despite the code
 // looking complete. Keep this at 15 characters or fewer if you rename it.
 static const char* DEVICE_ID        = "cbc1";
-static const char* FIRMWARE_VERSION = "1.9.1";
+static const char* FIRMWARE_VERSION = "1.9.2";
 
 // ------------------------------------------------------------------
 // Hardware -- I2C bus (INA219 current/voltage sensor + SH1106 OLED)

@@ -185,7 +185,7 @@ void controlLoop();
 void updateDisplay();
 void drawStrFit(int x, int y, int maxWidth, const char* text);
 void drawBatteryIcon(int x, int y, int w, int h, float fraction);
-void drawBigCentered(const char* text, int maxWidth);
+void drawBigCentered(const char* text, int maxWidth, const int baselineY[3]);
 void drawBigOverlay();
 void drawFaultScreen();
 void handleEncoderAndButton();
@@ -755,16 +755,17 @@ void drawBatteryIcon(int x, int y, int w, int h, float fraction) {
 // sizes that still fits within maxWidth px -- so a short string gets to
 // fill the screen while a longer one never clips. The smallest
 // (logisoso16, already used elsewhere on this display and known to fit
-// anything reasonable) is the guaranteed-fit fallback. Leaves the font
-// set to whichever one it used; callers needing a different font
-// afterward (e.g. a small label) must set it themselves.
-void drawBigCentered(const char* text, int maxWidth) {
-  // Baselines leave clearance below the text for a small text line at
-  // y=62 (drawFaultScreen's fault reason) -- 58 put the 32pt font's
-  // glyph body directly on top of it, since a font this tall reaches
-  // ~32px above its own baseline.
+// anything reasonable) is the guaranteed-fit fallback. baselineY is the
+// per-font-tier baseline to use (indices matching the 32pt/24pt/16pt
+// font order) -- callers pass their own since how much clearance is
+// needed below the text depends on what else is on that particular
+// screen (drawBigOverlay has nothing below it; drawFaultScreen has a
+// fixed reason line at y=62 that the default overlay baselines used to
+// overlap). Leaves the font set to whichever one it used; callers
+// needing a different font afterward (e.g. a small label) must set it
+// themselves.
+void drawBigCentered(const char* text, int maxWidth, const int baselineY[3]) {
   const uint8_t* bigFonts[] = {u8g2_font_logisoso32_tf, u8g2_font_logisoso24_tf, u8g2_font_logisoso16_tf};
-  const int baselineY[] = {48, 42, 34};
   for (uint8_t i = 0; i < 3; i++) {
     u8g2.setFont(bigFonts[i]);
     int w = u8g2.getStrWidth(text);
@@ -793,7 +794,8 @@ void drawBigOverlay() {
   drawStrFit(0, 9, 128, label);
   u8g2.drawHLine(0, 12, 128);
 
-  drawBigCentered(buf, 124);
+  static const int kOverlayBaselineY[] = {58, 50, 40};
+  drawBigCentered(buf, 124, kOverlayBaselineY);
 }
 
 // Fault takes over the whole screen -- the word itself as big as will
@@ -802,7 +804,11 @@ void drawBigOverlay() {
 // vary in length and several are too long for this font at full size,
 // see the display-overflow fixes earlier in this project's history).
 void drawFaultScreen() {
-  drawBigCentered("FAULT", 124);
+  // Raised vs. the overlay's baselines -- this screen has a fixed
+  // reason line at y=62 below it that the overlay's {58,50,40} would
+  // overlap (the 32pt font reaches ~32px above its own baseline).
+  static const int kFaultBaselineY[] = {48, 42, 34};
+  drawBigCentered("FAULT", 124, kFaultBaselineY);
   u8g2.setFont(u8g2_font_6x10_tf);
   drawStrFit(0, 62, 128, faultReason.c_str());
 }
