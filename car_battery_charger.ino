@@ -34,9 +34,13 @@
  *     to 3V3 satisfies that passively, since the DS18B20 stays idle/high-Z
  *     until the bus is actively addressed -- see config.h.example.
  *
- * Standalone device -- no WiFi/MQTT/Home Assistant/OTA. Everything is
- * local: the OLED + rotary encoder are the only interface. Re-flashing
- * always needs a USB cable.
+ * No MQTT/Home Assistant/OTA -- re-flashing always needs a USB cable.
+ * The OLED + rotary encoder remain the primary local interface, but the
+ * device also hosts its own WiFi access point (see config.h's Web
+ * portal section) serving a local dashboard that mirrors the OLED/LED,
+ * offers the same controls as the encoder/button, and streams recent
+ * Serial output -- no home network or setup portal involved, it's just
+ * always up. See setupWebPortal()/buildStatusJson() below.
  *
  * Charge algorithm (flooded/AGM lead-acid):
  *   RECOVERY: entered instead of BULK if the battery's resting voltage
@@ -119,8 +123,45 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <Adafruit_NeoPixel.h>
+#include <WiFi.h>
+#include <WebServer.h>
 
 #include "config.h"
+
+// ------------------------------------------------------------------
+// Serial mirror -- every logOut.print/println/printf() call in this
+// sketch (everything that used to be Serial.print*) both writes to the
+// real Serial port AND appends to a fixed-size ring buffer that the web
+// portal's /api/log serves, so the browser sees the same stream as a
+// USB serial monitor without needing one plugged in. Serial.begin()
+// itself is untouched -- Print has no begin() of its own.
+// ------------------------------------------------------------------
+class TeeSerial : public Print {
+public:
+  size_t write(uint8_t c) override {
+    Serial.write(c);
+    buf[head] = c;
+    head = (head + 1) % WEB_LOG_BUFFER_SIZE;
+    if (len < WEB_LOG_BUFFER_SIZE) len++;
+    return 1;
+  }
+  size_t write(const uint8_t* buffer, size_t size) override {
+    for (size_t i = 0; i < size; i++) write(buffer[i]);
+    return size;
+  }
+  String snapshot() const {
+    String out;
+    out.reserve(len);
+    size_t start = (len < WEB_LOG_BUFFER_SIZE) ? 0 : head;
+    for (size_t i = 0; i < len; i++) out += (char)buf[(start + i) % WEB_LOG_BUFFER_SIZE];
+    return out;
+  }
+private:
+  uint8_t buf[WEB_LOG_BUFFER_SIZE];
+  size_t head = 0;
+  size_t len = 0;
+};
+TeeSerial logOut;
 
 // ------------------------------------------------------------------
 // Charge state machine
@@ -239,6 +280,8 @@ uint8_t activeBeepIndex = 0;
 unsigned long beepStepStartMs = 0;
 bool beeping = false;
 
+WebServer webServer(80);
+
 // ------------------------------------------------------------------
 // Forward declarations
 // ------------------------------------------------------------------
@@ -270,6 +313,13 @@ void updateHeatsinkTemp();
 void enterCalibrationMode();
 void exitCalibrationMode(bool save);
 void updateCalibrationScreen();
+void applyEncoderStep(int32_t detents);
+void applyCalibrationStep(int32_t detents);
+void toggleUiMode();
+void handleClickAction();
+String buildStatusJson();
+void setupWebPortal();
+void handleWebClient();
 
 // ------------------------------------------------------------------
 // Helpers
@@ -488,7 +538,7 @@ void updateHeatsinkTemp() {
 // ------------------------------------------------------------------
 void loadPersistedSettings() {
   if (!prefs.begin(DEVICE_ID, /*readOnly=*/false)) {
-    Serial.println("[nvs] FAILED to open Preferences namespace -- using compiled defaults, settings will not persist");
+    logOut.println("[nvs] FAILED to open Preferences namespace -- using compiled defaults, settings will not persist");
     return;
   }
   useEasyMode = prefs.getBool("easyMode", false);
@@ -497,7 +547,7 @@ void loadPersistedSettings() {
   targetCurrentA = prefs.getFloat("targetA", DEFAULT_MANUAL_CURRENT_A);
   runtimeDividerRatio = prefs.getFloat("divRatio", SUPPLY_DIVIDER_RATIO);
   prefs.end();
-  Serial.printf("[nvs] loaded: %s mode, capacity index %u, target %.2fA, divider ratio %.3f\n",
+  logOut.printf("[nvs] loaded: %s mode, capacity index %u, target %.2fA, divider ratio %.3f\n",
                 useEasyMode ? "easy" : "manual", capacityPresetIndex, targetCurrentA, runtimeDividerRatio);
 
   if (useEasyMode) {
@@ -511,7 +561,7 @@ void loadPersistedSettings() {
 
 void savePersistedSettings() {
   if (!prefs.begin(DEVICE_ID, /*readOnly=*/false)) {
-    Serial.println("[nvs] FAILED to open Preferences namespace -- settings will not persist");
+    logOut.println("[nvs] FAILED to open Preferences namespace -- settings will not persist");
     return;
   }
   prefs.putBool("easyMode", useEasyMode);
@@ -526,12 +576,12 @@ void savePersistedSettings() {
 // use.
 void saveDividerRatio() {
   if (!prefs.begin(DEVICE_ID, /*readOnly=*/false)) {
-    Serial.println("[nvs] FAILED to open Preferences namespace -- divider ratio will not persist");
+    logOut.println("[nvs] FAILED to open Preferences namespace -- divider ratio will not persist");
     return;
   }
   prefs.putFloat("divRatio", runtimeDividerRatio);
   prefs.end();
-  Serial.printf("[nvs] saved divider ratio: %.3f\n", runtimeDividerRatio);
+  logOut.printf("[nvs] saved divider ratio: %.3f\n", runtimeDividerRatio);
 }
 
 // ------------------------------------------------------------------
@@ -554,7 +604,7 @@ void startCharging() {
     chargeState = STATE_FAULT;
     updateStatusLedForState();
     startBeepPattern(BUZZER_FAULT_FREQ_HZ, BUZZER_FAULT_DUR_MS, BEEP_LEN(BUZZER_FAULT_FREQ_HZ));
-    Serial.println("[charge] refusing to start: DS18B20 not detected (REQUIRE_HEATSINK_SENSOR)");
+    logOut.println("[charge] refusing to start: DS18B20 not detected (REQUIRE_HEATSINK_SENSOR)");
     return;
   }
 
@@ -567,7 +617,7 @@ void startCharging() {
     chargeState = STATE_FAULT;
     updateStatusLedForState();
     startBeepPattern(BUZZER_FAULT_FREQ_HZ, BUZZER_FAULT_DUR_MS, BEEP_LEN(BUZZER_FAULT_FREQ_HZ));
-    Serial.printf("[charge] refusing to start: OCV=%.2fV below threshold\n", ocv);
+    logOut.printf("[charge] refusing to start: OCV=%.2fV below threshold\n", ocv);
     return;
   }
   if (ocv >= OVER_VOLTAGE_CUTOFF) {
@@ -575,7 +625,7 @@ void startCharging() {
     chargeState = STATE_FAULT;
     updateStatusLedForState();
     startBeepPattern(BUZZER_FAULT_FREQ_HZ, BUZZER_FAULT_DUR_MS, BEEP_LEN(BUZZER_FAULT_FREQ_HZ));
-    Serial.printf("[charge] refusing to start: OCV=%.2fV at/above cutoff\n", ocv);
+    logOut.printf("[charge] refusing to start: OCV=%.2fV at/above cutoff\n", ocv);
     return;
   }
 
@@ -601,11 +651,11 @@ void startCharging() {
     recoveryStartVoltage = ocv;
     recoveryProgressChecked = false;
     chargeState = STATE_RECOVERY;
-    Serial.printf("[charge] START recovery, current=%.2fA ocv=%.2fV (below %.1fV recovery threshold)\n",
+    logOut.printf("[charge] START recovery, current=%.2fA ocv=%.2fV (below %.1fV recovery threshold)\n",
                   recoveryCurrentA, ocv, RECOVERY_ENTRY_VOLTAGE_THRESHOLD);
   } else {
     chargeState = STATE_BULK;
-    Serial.printf("[charge] START target=%.2fA ocv=%.2fV initialSoC=%.0f%%\n",
+    logOut.printf("[charge] START target=%.2fA ocv=%.2fV initialSoC=%.0f%%\n",
                   targetCurrentA, ocv, initialSocFraction * 100.0f);
   }
 
@@ -624,7 +674,7 @@ void startCharging() {
 void enterCalibrationMode() {
   inCalibrationMode = true;
   calibrationRatio = runtimeDividerRatio;
-  Serial.printf("[cal] entering divider calibration, starting ratio=%.3f\n", calibrationRatio);
+  logOut.printf("[cal] entering divider calibration, starting ratio=%.3f\n", calibrationRatio);
 }
 
 void exitCalibrationMode(bool save) {
@@ -632,7 +682,7 @@ void exitCalibrationMode(bool save) {
     runtimeDividerRatio = calibrationRatio;
     saveDividerRatio();
   } else {
-    Serial.printf("[cal] cancelled, ratio unchanged (%.3f)\n", runtimeDividerRatio);
+    logOut.printf("[cal] cancelled, ratio unchanged (%.3f)\n", runtimeDividerRatio);
   }
   inCalibrationMode = false;
 }
@@ -642,7 +692,7 @@ void stopCharging(ChargeState endState, const String &reason) {
   softStarting = false;
   chargeState = endState;
   faultReason = reason;
-  Serial.printf("[charge] STOP -> %s (%s)\n", chargeStateName(endState), reason.c_str());
+  logOut.printf("[charge] STOP -> %s (%s)\n", chargeStateName(endState), reason.c_str());
   updateStatusLedForState();
   if (endState == STATE_DONE) {
     startBeepPattern(BUZZER_DONE_FREQ_HZ, BUZZER_DONE_DUR_MS, BEEP_LEN(BUZZER_DONE_FREQ_HZ));
@@ -742,7 +792,7 @@ void controlLoop() {
     if (busVoltage >= RECOVERY_EXIT_VOLTAGE) {
       chargeState = STATE_BULK;
       piIntegral = 0.0f;
-      Serial.println("[charge] RECOVERY -> BULK (battery responded)");
+      logOut.println("[charge] RECOVERY -> BULK (battery responded)");
       updateStatusLedForState();
     } else if (now - recoveryStartMs >= RECOVERY_TIMEOUT_MS) {
       stopCharging(STATE_FAULT, "Recovery failed -- battery unresponsive");
@@ -759,7 +809,7 @@ void controlLoop() {
       absorptionStartMs = now;
       piIntegral = 0.0f;
       belowTerminationSinceMs = 0;
-      Serial.println("[charge] BULK -> ABSORPTION");
+      logOut.println("[charge] BULK -> ABSORPTION");
       updateStatusLedForState();
     } else {
       float error = targetCurrentA - busCurrent;
@@ -795,7 +845,7 @@ void controlLoop() {
   static unsigned long lastControlLogMs = 0;
   if (now - lastControlLogMs >= 1000) {
     lastControlLogMs = now;
-    Serial.printf("[ctrl] state=%s V=%.2f I=%.2f target=%.2fA duty=%u/%u soc=%.0f%% heatsink=%s\n",
+    logOut.printf("[ctrl] state=%s V=%.2f I=%.2f target=%.2fA duty=%u/%u soc=%.0f%% heatsink=%s\n",
                   chargeStateName(chargeState), busVoltage, busCurrent, targetCurrentA,
                   gateDuty, GATE_PWM_MAX_DUTY, socFraction * 100.0f,
                   heatsinkSensorOk ? String(heatsinkTempC, 1).c_str() : "n/a");
@@ -832,6 +882,70 @@ void IRAM_ATTR onEncoderChange() {
   encoderPrevState = currState;
 }
 
+// Applies one rotation step (positive or negative) exactly like turning
+// the physical encoder one detent while idle -- shared by the real
+// encoder path and the web portal's step endpoints, so both apply the
+// identical clamped math instead of two copies that could drift apart.
+void applyEncoderStep(int32_t detents) {
+  // inCalibrationMode leaves chargeState at STATE_IDLE, so this guard
+  // alone wouldn't stop the web portal's step endpoint from firing
+  // during calibration the way the physical encoder structurally can't
+  // (handleEncoderAndButton() returns early in that branch, before ever
+  // reaching this call) -- excluded explicitly for the same effect.
+  if (chargeState != STATE_IDLE || inCalibrationMode) return;
+  if (useEasyMode) {
+    int newIdx = (int)capacityPresetIndex + detents;
+    capacityPresetIndex = (uint8_t)constrain(newIdx, 0, (int)CAPACITY_PRESETS_COUNT - 1);
+    selectedCapacityAh = CAPACITY_PRESETS_AH[capacityPresetIndex];
+    targetCurrentA = constrain(selectedCapacityAh * BULK_CURRENT_FRACTION_OF_CAPACITY,
+                                MANUAL_CURRENT_MIN_A, MAX_CHARGE_CURRENT_A);
+  } else {
+    float newTarget = targetCurrentA + detents * MANUAL_CURRENT_STEP_A;
+    targetCurrentA = constrain(newTarget, MANUAL_CURRENT_MIN_A, MAX_CHARGE_CURRENT_A);
+  }
+  overlaySettingsDirty = true;
+  bigOverlayUntilMs = millis() + BIG_OVERLAY_SCROLL_MS;
+}
+
+// Same idea for the divider-calibration ratio, while inCalibrationMode.
+void applyCalibrationStep(int32_t detents) {
+  calibrationRatio = constrain(calibrationRatio + detents * CALIBRATION_RATIO_STEP,
+                                CALIBRATION_RATIO_MIN, CALIBRATION_RATIO_MAX);
+}
+
+// Long-press's mode toggle, factored out so the web portal can trigger
+// the exact same transition (including the settings save and overlay).
+void toggleUiMode() {
+  if (chargeState != STATE_IDLE || inCalibrationMode) return; // see applyEncoderStep()'s comment
+  useEasyMode = !useEasyMode;
+  if (useEasyMode) {
+    selectedCapacityAh = CAPACITY_PRESETS_AH[capacityPresetIndex];
+    targetCurrentA = constrain(selectedCapacityAh * BULK_CURRENT_FRACTION_OF_CAPACITY,
+                                MANUAL_CURRENT_MIN_A, MAX_CHARGE_CURRENT_A);
+  } else {
+    selectedCapacityAh = 0;
+  }
+  savePersistedSettings();
+  bigOverlayUntilMs = millis() + BIG_OVERLAY_MODE_SWITCH_MS;
+  logOut.printf("[ui] switched to %s mode\n", useEasyMode ? "easy" : "manual");
+}
+
+// The click button's dispatch (start / stop / acknowledge), factored out
+// so the web portal's single "action" button does exactly what a
+// physical click does in every state, with no separate copy to drift.
+void handleClickAction() {
+  if (inCalibrationMode) return; // see applyEncoderStep()'s comment
+  if (chargeState == STATE_IDLE) {
+    startCharging();
+  } else if (chargeState == STATE_RECOVERY || chargeState == STATE_BULK || chargeState == STATE_ABSORPTION) {
+    stopCharging(STATE_IDLE, "Stopped by user");
+  } else { // DONE or FAULT -- acknowledge and return to idle
+    chargeState = STATE_IDLE;
+    faultReason = "";
+    updateStatusLedForState();
+  }
+}
+
 // Consumes accumulated encoder ticks and any button edges, and updates
 // charge/UI state. Called every loop() iteration -- cheap when nothing
 // changed.
@@ -862,8 +976,7 @@ void handleEncoderAndButton() {
     if (rawDetents != 0) {
       encoderLastConsumedCount += rawDetents * ENCODER_EDGES_PER_DETENT;
       int32_t detents = ENCODER_REVERSED ? -rawDetents : rawDetents;
-      calibrationRatio = constrain(calibrationRatio + detents * CALIBRATION_RATIO_STEP,
-                                    CALIBRATION_RATIO_MIN, CALIBRATION_RATIO_MAX);
+      applyCalibrationStep(detents);
     }
 
     bool rawPressed = (digitalRead(ENCODER_SW_PIN) == LOW);
@@ -915,20 +1028,7 @@ void handleEncoderAndButton() {
       return;
     }
 
-    if (chargeState == STATE_IDLE) {
-      if (useEasyMode) {
-        int newIdx = (int)capacityPresetIndex + detents;
-        capacityPresetIndex = (uint8_t)constrain(newIdx, 0, (int)CAPACITY_PRESETS_COUNT - 1);
-        selectedCapacityAh = CAPACITY_PRESETS_AH[capacityPresetIndex];
-        targetCurrentA = constrain(selectedCapacityAh * BULK_CURRENT_FRACTION_OF_CAPACITY,
-                                    MANUAL_CURRENT_MIN_A, MAX_CHARGE_CURRENT_A);
-      } else {
-        float newTarget = targetCurrentA + detents * MANUAL_CURRENT_STEP_A;
-        targetCurrentA = constrain(newTarget, MANUAL_CURRENT_MIN_A, MAX_CHARGE_CURRENT_A);
-      }
-      overlaySettingsDirty = true;
-      bigOverlayUntilMs = now + BIG_OVERLAY_SCROLL_MS;
-    }
+    applyEncoderStep(detents);
   }
 
   // ---- Button (active low) with debounce + long-press detection ----
@@ -946,16 +1046,7 @@ void handleEncoderAndButton() {
     } else {
       // release -- if a long press already fired, this release does nothing more
       if (!buttonLongPressFired) {
-        // ---- short click ----
-        if (chargeState == STATE_IDLE) {
-          startCharging();
-        } else if (chargeState == STATE_RECOVERY || chargeState == STATE_BULK || chargeState == STATE_ABSORPTION) {
-          stopCharging(STATE_IDLE, "Stopped by user");
-        } else { // DONE or FAULT -- acknowledge and return to idle
-          chargeState = STATE_IDLE;
-          faultReason = "";
-          updateStatusLedForState();
-        }
+        handleClickAction();
       }
     }
   }
@@ -963,19 +1054,7 @@ void handleEncoderAndButton() {
   // long-press fires once, while still held, without waiting for release
   if (buttonStable && !buttonLongPressFired && (now - buttonPressStartMs) >= LONG_PRESS_MS) {
     buttonLongPressFired = true;
-    if (chargeState == STATE_IDLE) {
-      useEasyMode = !useEasyMode;
-      if (useEasyMode) {
-        selectedCapacityAh = CAPACITY_PRESETS_AH[capacityPresetIndex];
-        targetCurrentA = constrain(selectedCapacityAh * BULK_CURRENT_FRACTION_OF_CAPACITY,
-                                    MANUAL_CURRENT_MIN_A, MAX_CHARGE_CURRENT_A);
-      } else {
-        selectedCapacityAh = 0;
-      }
-      savePersistedSettings();
-      bigOverlayUntilMs = now + BIG_OVERLAY_MODE_SWITCH_MS;
-      Serial.printf("[ui] switched to %s mode\n", useEasyMode ? "easy" : "manual");
-    }
+    toggleUiMode();
   }
 }
 
@@ -1202,20 +1281,263 @@ void updateDisplay() {
 }
 
 // ------------------------------------------------------------------
+// Web portal -- onboard WiFi AP + local dashboard. Mirrors the OLED/LED
+// (status JSON, polled), offers the same actions as the physical
+// encoder/button (each web action calls the exact same shared function
+// the encoder/button path calls -- applyEncoderStep(), applyCalibrationStep(),
+// toggleUiMode(), handleClickAction(), enterCalibrationMode(),
+// exitCalibrationMode() -- so there's one behavior, not two copies that
+// could drift apart), and streams the logOut ring buffer as a Serial-
+// monitor substitute. WebServer::handleClient() is synchronous and only
+// blocks for the (fast, local, sub-10ms) duration of an actual request,
+// so calling it once per loop() iteration doesn't meaningfully disturb
+// the control loop's timing -- it already measures real elapsed dtSec
+// rather than assuming a fixed step.
+// ------------------------------------------------------------------
+static const char DASHBOARD_HTML[] = R"HTMLDOC(<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Car Battery Charger</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:#0f1420; color:#e8ecf4; font-family:-apple-system,Segoe UI,Roboto,sans-serif; }
+  h1 { font-size:1.1rem; margin:0 0 12px; text-align:center; letter-spacing:.02em; }
+  h2 { font-size:.8rem; text-transform:uppercase; letter-spacing:.06em; opacity:.7; margin:0 0 10px; }
+  .card { background:#1a2233; border-radius:10px; padding:14px 16px; margin-bottom:12px; }
+  .state { font-size:1.6rem; font-weight:700; text-align:center; padding:10px; border-radius:8px; margin-bottom:12px; }
+  .state.idle{background:#1c3a5e;color:#7fc4ff;}
+  .state.recovery{background:#4a1c5e;color:#e07fff;}
+  .state.bulk{background:#5e4a1c;color:#ffe07f;}
+  .state.absorption{background:#5e3a1c;color:#ffa87f;}
+  .state.done{background:#1c5e28;color:#7fff9c;}
+  .state.fault{background:#5e1c1c;color:#ff7f7f;}
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .metric{text-align:center;}
+  .metric .v{font-size:1.4rem;font-weight:600;font-variant-numeric:tabular-nums;}
+  .metric .l{font-size:.72rem;opacity:.65;text-transform:uppercase;letter-spacing:.05em;}
+  .fault-reason{grid-column:1/-1;text-align:center;color:#ff9d9d;font-size:.85rem;padding-top:4px;}
+  button{font:inherit;border:none;border-radius:8px;padding:12px;cursor:pointer;font-weight:600;}
+  .btn-row{display:flex;gap:8px;margin-top:10px;}
+  .btn-row button{flex:1;}
+  .btn-primary{background:#3576d9;color:#fff;}
+  .btn-secondary{background:#2a3450;color:#cfd8ee;}
+  .btn-step{background:#2a3450;color:#e8ecf4;font-size:1.3rem;padding:10px 0;min-width:52px;}
+  .stepper{display:flex;align-items:center;gap:10px;justify-content:center;margin-top:8px;}
+  .stepper .val{min-width:110px;text-align:center;font-size:1.1rem;font-variant-numeric:tabular-nums;}
+  .toggle-row{display:flex;justify-content:space-between;align-items:center;}
+  #log{background:#05070c;color:#8fd88f;font:12px/1.4 ui-monospace,Consolas,monospace;padding:10px;border-radius:8px;height:180px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;}
+</style>
+</head><body>
+<h1>Car Battery Charger</h1>
+<div id="stateBox" class="state idle">--</div>
+
+<div class="card grid">
+  <div class="metric"><div class="v" id="mVoltage">--</div><div class="l">Battery V</div></div>
+  <div class="metric"><div class="v" id="mCurrent">--</div><div class="l">Current A</div></div>
+  <div class="metric"><div class="v" id="mSoc">--</div><div class="l">State of charge</div></div>
+  <div class="metric"><div class="v" id="mTemp">--</div><div class="l">Heatsink</div></div>
+  <div class="fault-reason" id="faultReason" style="display:none"></div>
+</div>
+
+<div class="card">
+  <button class="btn-primary" id="actionBtn" style="width:100%" onclick="doClick()">--</button>
+</div>
+
+<div class="card" id="modeCard">
+  <div class="toggle-row">
+    <h2 style="margin:0">Mode: <span id="modeLabel">--</span></h2>
+    <button class="btn-secondary" onclick="doMode()">Switch</button>
+  </div>
+  <div class="stepper">
+    <button class="btn-step" onclick="doStep('down')">&minus;</button>
+    <div class="val" id="targetVal">--</div>
+    <button class="btn-step" onclick="doStep('up')">+</button>
+  </div>
+</div>
+
+<div class="card" id="calCard">
+  <h2>Divider calibration</h2>
+  <div id="calIdle">
+    <button class="btn-secondary" style="width:100%" onclick="calEnter()">Enter calibration</button>
+  </div>
+  <div id="calActive" style="display:none">
+    <div class="stepper">
+      <button class="btn-step" onclick="calStep('down')">&minus;</button>
+      <div class="val" id="calVal">--</div>
+      <button class="btn-step" onclick="calStep('up')">+</button>
+    </div>
+    <div class="btn-row">
+      <button class="btn-secondary" onclick="calCancel()">Cancel</button>
+      <button class="btn-primary" onclick="calSave()">Save</button>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Serial log</h2>
+  <div id="log"></div>
+</div>
+
+<script>
+function stateClass(s){ return s.toLowerCase(); }
+async function refresh(){
+  try{
+    const r = await fetch('/api/status'); const d = await r.json();
+    const box = document.getElementById('stateBox');
+    box.textContent = d.state; box.className = 'state ' + stateClass(d.state);
+    document.getElementById('mVoltage').textContent = d.voltage.toFixed(2);
+    document.getElementById('mCurrent').textContent = d.current.toFixed(2);
+    document.getElementById('mSoc').textContent = d.soc.toFixed(0) + '%';
+    document.getElementById('mTemp').textContent = d.heatsinkOk ? (d.heatsinkTemp.toFixed(0)+'C') : '--';
+    const fr = document.getElementById('faultReason');
+    if(d.state === 'Fault' && d.faultReason){ fr.style.display='block'; fr.textContent = d.faultReason; }
+    else { fr.style.display='none'; }
+    const running = (d.state==='Recovery'||d.state==='Bulk'||d.state==='Absorption');
+    document.getElementById('actionBtn').textContent =
+      running ? 'Stop' : (d.state==='Done'||d.state==='Fault') ? 'Acknowledge' : 'Start';
+    document.getElementById('modeLabel').textContent = d.easyMode ? 'Easy' : 'Manual';
+    document.getElementById('targetVal').textContent =
+      d.easyMode ? (d.capacityAh + ' Ah') : (d.targetCurrent.toFixed(1) + ' A');
+    document.getElementById('modeCard').style.display = running ? 'none' : 'block';
+    document.getElementById('calCard').style.display = running ? 'none' : 'block';
+    if(d.inCalibration){
+      document.getElementById('calIdle').style.display='none';
+      document.getElementById('calActive').style.display='block';
+      document.getElementById('calVal').textContent = d.calibrationRatio.toFixed(3);
+    } else {
+      document.getElementById('calIdle').style.display='block';
+      document.getElementById('calActive').style.display='none';
+    }
+  }catch(e){}
+}
+async function post(url){ try{ await fetch(url, {method:'POST'}); }catch(e){} refresh(); }
+function doClick(){ post('/api/click'); }
+function doMode(){ post('/api/mode'); }
+function doStep(dir){ post('/api/step?dir='+dir); }
+function calEnter(){ post('/api/cal/enter'); }
+function calStep(dir){ post('/api/cal/step?dir='+dir); }
+function calSave(){ post('/api/cal/save'); }
+function calCancel(){ post('/api/cal/cancel'); }
+let lastLogLen = -1;
+async function refreshLog(){
+  try{
+    const r = await fetch('/api/log'); const t = await r.text();
+    if(t.length !== lastLogLen){
+      const el = document.getElementById('log');
+      const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+      el.textContent = t;
+      if(atBottom) el.scrollTop = el.scrollHeight;
+      lastLogLen = t.length;
+    }
+  }catch(e){}
+}
+refresh(); refreshLog();
+setInterval(refresh, 1000);
+setInterval(refreshLog, 2000);
+</script>
+</body></html>
+)HTMLDOC";
+
+String buildStatusJson() {
+  String json = "{";
+  json += "\"state\":\"";        json += chargeStateName(chargeState);                 json += "\",";
+  json += "\"faultReason\":\"";  json += faultReason;                                   json += "\",";
+  json += "\"voltage\":";        json += String(busVoltage, 3);                         json += ",";
+  json += "\"current\":";        json += String(busCurrent, 3);                         json += ",";
+  json += "\"soc\":";            json += String(socFraction * 100.0f, 1);               json += ",";
+  json += "\"heatsinkOk\":";     json += (heatsinkSensorOk ? "true" : "false");          json += ",";
+  json += "\"heatsinkTemp\":";   json += String(isnan(heatsinkTempC) ? 0.0f : heatsinkTempC, 1); json += ",";
+  json += "\"easyMode\":";       json += (useEasyMode ? "true" : "false");               json += ",";
+  json += "\"capacityAh\":";     json += String(selectedCapacityAh);                     json += ",";
+  json += "\"targetCurrent\":";  json += String(targetCurrentA, 2);                      json += ",";
+  json += "\"gateDuty\":";       json += String(gateDuty);                               json += ",";
+  json += "\"gateDutyMax\":";    json += String(GATE_PWM_MAX_DUTY);                      json += ",";
+  json += "\"dividerRatio\":";   json += String(runtimeDividerRatio, 3);                 json += ",";
+  json += "\"inCalibration\":";  json += (inCalibrationMode ? "true" : "false");         json += ",";
+  json += "\"calibrationRatio\":"; json += String(calibrationRatio, 3);
+  json += "}";
+  return json;
+}
+
+void setupWebPortal() {
+  if (!WEB_PORTAL_ENABLED) return;
+
+  WiFi.mode(WIFI_AP);
+  bool apOk = WiFi.softAP(AP_SSID, strlen(AP_PASSWORD) > 0 ? AP_PASSWORD : nullptr);
+  logOut.printf("[web] AP '%s' %s, connect and browse to http://%s/\n",
+                AP_SSID, apOk ? "up" : "FAILED to start", WiFi.softAPIP().toString().c_str());
+
+  webServer.on("/", HTTP_GET, []() {
+    webServer.send(200, "text/html", DASHBOARD_HTML);
+  });
+  webServer.on("/api/status", HTTP_GET, []() {
+    webServer.send(200, "application/json", buildStatusJson());
+  });
+  webServer.on("/api/log", HTTP_GET, []() {
+    webServer.send(200, "text/plain", logOut.snapshot());
+  });
+  webServer.on("/api/click", HTTP_POST, []() {
+    handleClickAction();
+    webServer.send(200, "application/json", buildStatusJson());
+  });
+  webServer.on("/api/mode", HTTP_POST, []() {
+    toggleUiMode();
+    webServer.send(200, "application/json", buildStatusJson());
+  });
+  webServer.on("/api/step", HTTP_POST, []() {
+    int32_t d = (webServer.arg("dir") == "down") ? -1 : 1;
+    applyEncoderStep(d);
+    webServer.send(200, "application/json", buildStatusJson());
+  });
+  webServer.on("/api/cal/enter", HTTP_POST, []() {
+    // Same guard as the physical hold+turn gesture -- idle only, and
+    // don't re-enter (which would reset calibrationRatio mid-session).
+    if (chargeState == STATE_IDLE && !inCalibrationMode) enterCalibrationMode();
+    webServer.send(200, "application/json", buildStatusJson());
+  });
+  webServer.on("/api/cal/step", HTTP_POST, []() {
+    if (inCalibrationMode) {
+      int32_t d = (webServer.arg("dir") == "down") ? -1 : 1;
+      applyCalibrationStep(d);
+    }
+    webServer.send(200, "application/json", buildStatusJson());
+  });
+  webServer.on("/api/cal/save", HTTP_POST, []() {
+    if (inCalibrationMode) exitCalibrationMode(true);
+    webServer.send(200, "application/json", buildStatusJson());
+  });
+  webServer.on("/api/cal/cancel", HTTP_POST, []() {
+    if (inCalibrationMode) exitCalibrationMode(false);
+    webServer.send(200, "application/json", buildStatusJson());
+  });
+  webServer.onNotFound([]() {
+    webServer.send(404, "text/plain", "Not found");
+  });
+
+  webServer.begin();
+  logOut.println("[web] server started on port 80");
+}
+
+void handleWebClient() {
+  if (WEB_PORTAL_ENABLED) webServer.handleClient();
+}
+
+// ------------------------------------------------------------------
 // Setup / loop
 // ------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n[Car Battery Charger] booting, reset reason: " + resetReasonString());
-  Serial.printf("[fw] version %s\n", FIRMWARE_VERSION);
+  logOut.println("\n[Car Battery Charger] booting, reset reason: " + resetReasonString());
+  logOut.printf("[fw] version %s\n", FIRMWARE_VERSION);
 
   // Gate pin: pulled low immediately, before ledcAttach, so there's no
   // window where it floats high and turns the MOSFET on.
   pinMode(MOSFET_GATE_PIN, OUTPUT);
   digitalWrite(MOSFET_GATE_PIN, LOW);
   bool ledcOk = ledcAttach(MOSFET_GATE_PIN, GATE_PWM_FREQ_HZ, GATE_PWM_RESOLUTION);
-  Serial.printf("[gate] ledcAttach(pin=%d, freq=%uHz, res=%ubit) = %s\n",
+  logOut.printf("[gate] ledcAttach(pin=%d, freq=%uHz, res=%ubit) = %s\n",
                 MOSFET_GATE_PIN, (unsigned)GATE_PWM_FREQ_HZ, (unsigned)GATE_PWM_RESOLUTION,
                 ledcOk ? "ok" : "FAILED");
   applyGateDuty(0);
@@ -1230,7 +1552,7 @@ void setup() {
   if (STATUS_LED_ENABLED) {
     statusLed.begin();
     statusLed.show();
-    Serial.println("[led] status LED initialized on GPIO" + String(STATUS_LED_PIN));
+    logOut.println("[led] status LED initialized on GPIO" + String(STATUS_LED_PIN));
   }
 
   if (BUZZER_ENABLED) {
@@ -1242,16 +1564,16 @@ void setup() {
   heatsinkTempSensor.setWaitForConversion(false); // non-blocking -- see updateHeatsinkTemp()
   {
     int dsCount = heatsinkTempSensor.getDeviceCount();
-    Serial.printf("[temp] DS18B20 devices found: %d%s\n", dsCount,
+    logOut.printf("[temp] DS18B20 devices found: %d%s\n", dsCount,
                   dsCount == 0 ? " -- check wiring/pull-up on GPIO2" : "");
   }
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   if (!ina219.begin()) {
-    Serial.println("[ina219] FAILED to initialize -- check wiring/address");
+    logOut.println("[ina219] FAILED to initialize -- check wiring/address");
   }
   ina219WriteCalibration(INA219_CALIBRATION);
-  Serial.printf("[ina219] custom calibration=%u current_lsb=%.6fA/bit (0.01ohm shunt)\n",
+  logOut.printf("[ina219] custom calibration=%u current_lsb=%.6fA/bit (0.01ohm shunt)\n",
                 INA219_CALIBRATION, INA219_CURRENT_LSB_A);
   u8g2.begin();
 
@@ -1261,15 +1583,18 @@ void setup() {
   chargeState = STATE_IDLE; // never auto-resume charging after a reboot
   updateStatusLedForState();
 
-  Serial.printf("[supply] measured rail = %.2fV (ratio=%.3f -- hold the button and turn the encoder to calibrate)\n",
+  logOut.printf("[supply] measured rail = %.2fV (ratio=%.3f -- hold the button and turn the encoder to calibrate)\n",
                 readSupplyVoltage(), runtimeDividerRatio);
 
+  setupWebPortal();
+
   lastControlLoopMs = millis();
-  Serial.println("[boot] ready");
+  logOut.println("[boot] ready");
 }
 
 void loop() {
   handleEncoderAndButton();
+  handleWebClient();
   updateBuzzer();
   updateHeatsinkTemp();
 

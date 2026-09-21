@@ -176,6 +176,26 @@ static const uint32_t HEATSINK_TEMP_POLL_MS   = 1000UL;
 static const uint32_t HEATSINK_CONVERSION_MS  = 750UL;
 
 // ------------------------------------------------------------------
+// Web portal -- the ESP32-C3 hosts its own WiFi access point (no home
+// network needed) and serves a local status/control page, always on
+// from boot. Connect a phone/laptop to AP_SSID and browse to
+// http://192.168.4.1/ -- that's WiFi.softAP()'s fixed default address,
+// not something to configure. Mirrors the OLED/LED (state, voltage,
+// current, SoC%, heatsink temp), offers the same actions as the
+// physical encoder/button (start/stop, mode toggle, capacity/current
+// step, divider calibration), and streams recent Serial output.
+//
+// This is a LOCAL AP with no internet uplink and, by default, no
+// password -- anyone in radio range can join it and control the
+// charger. Set AP_PASSWORD (8-63 chars, WPA2 minimum) if that matters
+// in your environment.
+// ------------------------------------------------------------------
+static const bool WEB_PORTAL_ENABLED = true;
+static const char* AP_SSID     = "CarBatteryCharger";
+static const char* AP_PASSWORD = ""; // "" = open network
+static const int WEB_LOG_BUFFER_SIZE = 4096; // bytes of recent Serial output kept for /api/log
+
+// ------------------------------------------------------------------
 // Hardware -- piezo buzzer (passive, driven via the ESP32 core's
 // tone()/noTone(), which manages its own LEDC channel internally --
 // no conflict with the MOSFET gate's own ledcAttach() on a different

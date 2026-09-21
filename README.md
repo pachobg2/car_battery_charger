@@ -1,12 +1,15 @@
 # Car Battery Charger — ESP32-C3-Zero smart lead-acid charger
 
 Standalone smart charger for flooded/AGM 12V-100Ah down to small 3Ah SLA
-batteries. No WiFi/MQTT/cloud/OTA — everything is local: an INA219
-current sensor, a second ADC-based supply-voltage sense, a DS18B20
-heatsink temperature sensor, a SH1106 128x64 OLED, a rotary encoder with
-push button, and a piezo buzzer are the entire interface. A fuse and a
-reverse-polarity diode protect the battery leads. Re-flashing always
-needs a USB cable.
+batteries. No MQTT/cloud/OTA — an INA219 current sensor, a second
+ADC-based supply-voltage sense, a DS18B20 heatsink temperature sensor, a
+SH1106 128x64 OLED, a rotary encoder with push button, and a piezo
+buzzer are the primary local interface. A fuse and a reverse-polarity
+diode protect the battery leads. Re-flashing always needs a USB cable.
+
+The device also hosts its own WiFi access point and serves a local web
+dashboard, always on from boot — no home network, no setup portal,
+nothing to configure at runtime. See "Web portal" below.
 
 **Read the Hardware section below before wiring this up.** This design
 regulates charge current by running a bank of 4 parallel IRL540N MOSFETs
@@ -39,7 +42,7 @@ battery voltage directly.
      wasn't found -- just a dead LED and a boot-time Serial line as the
      only clue. That guard is gone; a missing library is now a normal
      compile error.)
-   Built-in: `Preferences`, `Wire`.
+   Built-in: `Preferences`, `Wire`, `WiFi`, `WebServer`.
 3. Select board **"ESP32C3 Dev Module"**, and under Tools set **USB CDC
    On Boot: Enabled** (needed for Serial over native USB).
 4. Rename `config.h.example` to `config.h` and fill in any pins that
@@ -519,12 +522,41 @@ points, not calibrated for your exact RC filter/MOSFET sample: if current
 or voltage oscillates, lower the Kp for that stage; if it settles too
 slowly, raise Ki a little.
 
-## Bluetooth / companion app
+## Web portal
 
-The ESP32-C3 has BLE, but this build has no networking or remote control
-at all — the encoder and OLED are the only interface. If a phone app is
-wanted later, the natural next step is adding a BLE GATT service
-alongside the existing control loop.
+The ESP32-C3 hosts its own WiFi access point, always on from boot — no
+home network, no first-run setup portal, nothing to type in. Connect a
+phone or laptop to `AP_SSID` (`config.h`, default `CarBatteryCharger`)
+and browse to `http://192.168.4.1/` — that's `WiFi.softAP()`'s fixed
+default address, not something you configure.
+
+The page mirrors the OLED/LED (charge state, battery voltage/current,
+SoC%, heatsink temperature, fault reason) and offers the same actions as
+the physical encoder/button: start/stop/acknowledge, switch easy/manual
+mode, step the capacity preset or manual current, and run divider
+calibration (enter/step/save/cancel). Every one of those calls the exact
+same function the physical control calls (`applyEncoderStep()`,
+`toggleUiMode()`, `handleClickAction()`, `enterCalibrationMode()`,
+`exitCalibrationMode()`) — there's one implementation of each action,
+not a web copy that could drift from the encoder's behavior. A "Serial
+log" panel streams the last `WEB_LOG_BUFFER_SIZE` bytes (4KB default) of
+everything the sketch would otherwise only print to a USB serial
+monitor, polled every couple of seconds — a `TeeSerial` (`logOut` in the
+sketch, replacing every `Serial.print*` call) writes to both the real
+Serial port and this ring buffer at once.
+
+The status page polls `/api/status` (JSON) every second and the log
+polls `/api/log` (plain text) every two seconds; controls are plain POST
+requests (`/api/click`, `/api/mode`, `/api/step?dir=up|down`,
+`/api/cal/enter`, `/api/cal/step?dir=up|down`, `/api/cal/save`,
+`/api/cal/cancel`). No auth, no HTTPS, no rate limiting — it's a LOCAL
+access point with no internet uplink, but by the same token anyone in
+WiFi range who joins it can see and control the charger. Set
+`AP_PASSWORD` in `config.h` (8-63 characters, WPA2 minimum) if that
+matters in your environment; empty means an open network.
+
+Set `WEB_PORTAL_ENABLED = false` in `config.h` to disable WiFi/the
+server entirely and go back to a purely local, radio-silent device.
 
 ## A note on verification
 
@@ -598,3 +630,4 @@ for the closest available size in that family and swap it into the
 | v1.11.0 | 2026-09-21 | Four additions: (1) a DS18B20 heatsink sensor (OneWire, GPIO2) gives a real runtime over-temperature cutoff (`MAX_HEATSINK_TEMP_C`, 80C default) instead of relying on someone watching the heatsink -- non-blocking (`updateHeatsinkTemp()`), refuses to start without the sensor by default (`REQUIRE_HEATSINK_SENSOR`); (2) a fuse and a reverse-polarity diode in the battery+ lead, hardware-only (schematic updated), with the supply-voltage divider's sense tap relocated to *after* both so the diode's forward drop doesn't skew every reading; (3) Recovery now checks its own progress at `RECOVERY_CHECK_MS` (5 min) and faults early if voltage hasn't risen `RECOVERY_MIN_RISE_V` (0.15V), instead of always waiting the full 30-minute timeout on a battery with a shorted cell; (4) a live divider-calibration mode (hold the button, turn the encoder) tunes `SUPPLY_DIVIDER_RATIO` against a multimeter and saves to NVS without a reflash. Also fixed real overlap bugs in the schematic: the 100R gate-stopper resistors overlapped the MOSFET boxes in all four columns (a 12px encroachment that was there since the diagram's first version), and did a full coordinate re-audit while adding the fuse/diode/DS18B20 to it. |
 | v1.11.1 | 2026-09-21 | Removed the `__has_include(<Adafruit_NeoPixel.h>)` guard entirely -- the library is now a hard, unconditional `#include`. It was letting the sketch silently compile with zero LED code whenever the library wasn't visible to the compiler, with only a boot-time Serial line as a clue; a user had it installed and the LED still didn't work, tracing back to this. A missing library is now a normal compile error instead of a silent no-op. |
 | v1.11.2 | 2026-09-21 | Fixed the status LED's color order: `NEO_RGB` (per Waveshare's docs for the ESP32-C3-Zero) was wrong on the actual hardware -- confirmed by testing, fault showed green instead of red, an exact R/G swap that would have also made DONE show red instead of green. Changed to `NEO_GRB`. |
+| v1.12.0 | 2026-09-21 | Added a web portal: the ESP32-C3 hosts its own WiFi access point (`WEB_PORTAL_ENABLED`/`AP_SSID`/`AP_PASSWORD` in `config.h`), always on from boot, serving a dashboard at `http://192.168.4.1/` that mirrors the OLED/LED and offers the same controls as the encoder/button. Refactored the encoder/button handler's four actions (rotation step, calibration-ratio step, mode toggle, click dispatch) into shared functions (`applyEncoderStep()`, `applyCalibrationStep()`, `toggleUiMode()`, `handleClickAction()`) called by both the physical path and the new web endpoints, so there's one implementation of each, not two that could drift. Added `TeeSerial` (`logOut`, replacing every `Serial.print*` call) mirroring recent output into a ring buffer the portal serves at `/api/log`, so the dashboard's log panel shows the same stream a USB serial monitor would. |
